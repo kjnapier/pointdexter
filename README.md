@@ -22,7 +22,7 @@ Provide a CSV file containing the detections to be linked. The CSV file should h
 | `obs_vy`      | Observer Y velocity (Equatorial)    | au/day       | No            |
 | `obs_vz`      | Observer Z velocity (Equatorial)    | au/day       | No            |
 | `ast_ucty`    | Astrometric uncertainty             | arcseconds   | No            |
-| `magnitude`   | Apparent magnitude of detection     | magnitudes   | No            |
+| `mag`         | Apparent magnitude of detection     | magnitudes   | No            |
 | `filter`      | Photometric filter                  | string       | No            |
 | `detid`       | Detection ID                        | string       | No            |
 | `trackid`     | Tracklet ID                         | string       | No            |
