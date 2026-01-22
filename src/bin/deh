@@ -1,0 +1,2134 @@
+// //use std::env;
+
+// use std::process;
+// use std::f64::consts::PI;
+
+// use rayon::prelude::*;
+
+// use nalgebra::{DMatrix, DVector, Matrix3, Matrix3xX, Unit, Vector3, matrix};
+
+// use rand::Rng; // <-- REQUIRED for .gen_range()
+
+// // spacerocks
+// use spacerocks::data::{MU_BARY, SPEED_OF_LIGHT};
+// use spacerocks::transforms::{solve_for_universal_anomaly, stumpff_c, stumpff_s};
+// use spacerocks::{Observatory, Origin, SpaceRock, SpiceKernel, Time};
+
+// use kiddo::KdTree;
+// use kiddo::SquaredEuclidean;
+// use kiddo::NearestNeighbour;
+
+// use bloomfilter::Bloom;
+
+// use itertools::Itertools;
+
+// use spacerocks::transforms::calc_true_anomaly_from_mean_anomaly;
+
+// // spacerocks
+
+
+// use rand::thread_rng;
+// use rand_distr::{Distribution, Normal};
+// use std::collections::HashSet;
+// use ordered_float::OrderedFloat;
+
+// pub fn xyz_to_proj_matrix(r_ref: Vector3<f64>) -> Matrix3<f64> {
+//     let x_ref = r_ref.x;
+//     let y_ref = r_ref.y;
+//     let z_ref = r_ref.z;
+
+//     let r = (x_ref * x_ref + y_ref * y_ref + z_ref * z_ref).sqrt();
+//     let lon0 = y_ref.atan2(x_ref);
+//     let lat0 = (z_ref / r).asin();
+
+//     let slon0 = lon0.sin();
+//     let clon0 = lon0.cos();
+//     let slat0 = lat0.sin();
+//     let clat0 = lat0.cos();
+
+//     Matrix3::new(
+//         -slon0,           clon0,            0.0,
+//         -clon0 * slat0,  -slon0 * slat0,   clat0,
+//          clon0 * clat0,   slon0 * clat0,   slat0,
+//     )
+// }
+
+// pub fn proj_to_xyz_matrix(r_ref: Vector3<f64>) -> Matrix3<f64> {
+//     let x_ref = r_ref.x;
+//     let y_ref = r_ref.y;
+//     let z_ref = r_ref.z;
+
+//     let r = (x_ref * x_ref + y_ref * y_ref + z_ref * z_ref).sqrt();
+//     let lon0 = y_ref.atan2(x_ref);
+//     let lat0 = (z_ref / r).asin();
+
+//     let slon0 = lon0.sin();
+//     let clon0 = lon0.cos();
+//     let slat0 = lat0.sin();
+//     let clat0 = lat0.cos();
+
+//     Matrix3::new(
+//         -slon0,            -clon0 * slat0,  clon0 * clat0,
+//          clon0,            -slon0 * slat0,  slon0 * clat0,
+//          0.0,               clat0,          slat0,
+//     )
+// }
+
+// fn ecliptic_to_equatorial_vector(v_ecl: Vector3<f64>, epsilon: f64) -> Vector3<f64> {
+//     // Obliquity of the ecliptic (J2000) in radians
+//     //let epsilon = 23.4392911 * PI / 180.0;
+    
+//     let cos_e = epsilon.cos();
+//     let sin_e = epsilon.sin();
+
+//     // Rotation matrix around the X-axis
+//     let rot_x = Matrix3::new(
+//         1.0, 0.0, 0.0,
+//         0.0, cos_e, -sin_e,
+//         0.0, sin_e, cos_e,
+//     );
+
+//     rot_x * v_ecl
+// }
+
+// pub fn find_unique_f64_hashset(data: Vec<f64>) -> Vec<f64> {
+//     let unique_elements: HashSet<OrderedFloat<f64>> = data.into_iter().map(OrderedFloat).collect();
+
+//     unique_elements.into_iter().map(|x| x.0).collect()
+// }
+
+
+// // --- Detection ---
+
+// // pub struct Detection {
+// //     intid: i32,
+// //     rho_hat: Vector3<f64>,
+// //     astrom_sig: f64,
+// //     observer_position: Vector3<f64>,
+// //     observer_velocity: Vector3<f64>,
+// //     epoch: f64,
+// //     rho_hat_dot_observer_position: f64,
+// //     observer_distance_squared: f64,
+// // }
+
+// // impl Detection {
+// //     pub fn new(
+// //         intid: i32,
+// //         ra: f64,
+// //         dec: f64,
+// //         astrom_sig: f64,	
+// //         epoch: Time,
+// //         observer_position: Vector3<f64>,
+// //         observer_velocity: Vector3<f64>,
+// //     ) -> Self {
+
+// //         let rho_hat = Vector3::new(
+// //             ra.cos() * dec.cos(),
+// //             ra.sin() * dec.cos(),
+// //             dec.sin(),
+// //         );
+
+// //         let epoch_jd = epoch.tdb().jd();
+
+// //         let rho_hat_dot_observer_position = rho_hat.dot(&observer_position);
+         
+
+// //         let observer_distance_squared = observer_position
+// //             .iter()
+// //             .map(|&v| v * v)
+// //             .sum();
+
+// //         Detection {
+// //             intid,
+// //             rho_hat,
+// // 	    astrom_sig,
+// //             observer_position,
+// //             observer_velocity,
+// //             epoch: epoch_jd,
+// //             rho_hat_dot_observer_position,
+// //             observer_distance_squared,
+// //         }
+// //     }
+// // }
+
+// /// Implements Gauss' method for initial orbit determination from three observations.
+// /// This method uses three on-sky measurements to determine possible orbital solutions.
+// ///
+// /// # Arguments
+// /// * `o1`, `o2`, `o3` - Three observations, ordered by time
+// /// * `min_distance` - Minimum distance (in AU) to consider valid solutions
+// ///
+// /// # Returns
+// /// * `Some(Vec<SpaceRock>)` - Vector of possible orbit solutions
+// /// * `None` - If no valid solutions found
+// ///
+// /// The method:
+// /// 1. Orders observations chronologically
+// /// 2. Solves 8th degree polynomial for orbital distance
+// /// 3. Uses roots to generate candidate orbits
+// /// 4. Applies light-time correction to final solutions
+// pub fn gauss(
+//     o1: &Detection,
+//     o2: &Detection,
+//     o3: &Detection,
+//     min_distance: f64,
+// ) -> Option<Vec<SpaceRock>> {
+//     // get the order of the epochs
+//     let mut triplet = [o1, o2, o3];
+//     triplet.sort_by(|a, b| a.epoch.partial_cmp(&b.epoch).unwrap());
+
+//     let o1 = triplet[0].observer_position;
+//     let o2 = triplet[1].observer_position;
+//     let o3 = triplet[2].observer_position;
+
+//     let rho1 = triplet[0].rho_hat;
+//     let rho2 = triplet[1].rho_hat;
+//     let rho3 = triplet[2].rho_hat;
+
+//     let t1 = triplet[0].epoch;
+//     let t2 = triplet[1].epoch;
+//     let t3 = triplet[2].epoch;
+
+//     let tau1 = t1 - t2;
+//     let tau3 = t3 - t2;
+//     let tau = t3 - t1;
+
+//     let p1 = rho2.cross(&rho3);
+//     let p2 = rho1.cross(&rho3);
+//     let p3 = rho1.cross(&rho2);
+
+//     let d0 = rho1.dot(&p1);
+
+//     let d: Matrix3<f64> = Matrix3::new(
+//         o1.dot(&p1),
+//         o1.dot(&p2),
+//         o1.dot(&p3),
+//         o2.dot(&p1),
+//         o2.dot(&p2),
+//         o2.dot(&p3),
+//         o3.dot(&p1),
+//         o3.dot(&p2),
+//         o3.dot(&p3),
+//     );
+
+//     // get the item in the first row, second column
+//     let a = (1.0 / d0) * (-d[(0, 1)] * (tau3 / tau) + d[(1, 1)] + d[(2, 1)] * (tau1 / tau));
+//     let b = (1.0 / (6.0 * d0))
+//         * (d[(0, 1)] * (tau3.powi(2) - tau.powi(2)) * (tau3 / tau)
+//             + d[(2, 1)] * (tau.powi(2) - tau1.powi(2)) * (tau1 / tau));
+//     let e = o2.dot(&rho2);
+
+//     let o2sq = o2.dot(&o2);
+
+//     let aa = -(a.powi(2) + 2.0 * a * e + o2sq);
+//     let bb = -2.0 * MU_BARY * b * (a + e);
+//     let cc = -MU_BARY.powi(2) * b.powi(2);
+
+//     let mat = matrix![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+//                       0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+//                       0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0;
+//                       0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0;
+//                       0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0;
+//                       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0;
+//                       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0;
+//                       -cc, 0.0, 0.0, -bb, 0.0, 0.0, -aa, 0.0];
+
+//     let mat = match mat.try_schur(0.00001, 10000) {
+//         Some(mat) => mat,
+//         None => return None,
+//     };
+
+//     let complex_roots = mat.complex_eigenvalues();
+
+//     let roots: Vec<f64> = complex_roots
+//         .iter()
+//         .filter(|x| x.im == 0.0 && x.re > min_distance)
+//         .map(|x| x.re)
+//         .collect();
+//     if roots.len() == 0 {
+//         return None;
+//     }
+
+//     // create an empty vector to hold the orbits
+//     let mut res: Vec<SpaceRock> = Vec::new();
+//     for root in &roots {
+//         let a1 = (1.0 / d0)
+//             * ((6.0 * (d[(2, 0)] * (tau1 / tau3) + d[(1, 0)] * (tau / tau3)) * root.powi(3)
+//                 + MU_BARY * d[(2, 0)] * (tau.powi(2) - tau1.powi(2)) * (tau1 / tau3))
+//                 / (6.0 * root.powi(3) + MU_BARY * (tau.powi(2) - tau3.powi(2)))
+//                 - d[(0, 0)]);
+//         let a2 = a + (MU_BARY * b) / root.powi(3);
+//         let a3 = (1.0 / d0)
+//             * ((6.0 * (d[(0, 2)] * (tau3 / tau1) - d[(1, 2)] * (tau / tau1)) * root.powi(3)
+//                 + MU_BARY * d[(0, 2)] * (tau.powi(2) - tau3.powi(2)) * (tau3 / tau1))
+//                 / (6.0 * root.powi(3) + MU_BARY * (tau.powi(2) - tau1.powi(2)))
+//                 - d[(2, 2)]);
+
+//         let r1 = o1 + a1 * rho1;
+//         let r2 = o2 + a2 * rho2;
+//         let r3 = o3 + a3 * rho3;
+
+//         let f1 = 1.0 - 0.5 * (MU_BARY / root.powi(3)) * tau1.powi(2);
+//         let f3 = 1.0 - 0.5 * (MU_BARY / root.powi(3)) * tau3.powi(2);
+//         let g1 = tau1 - (1.0 / 6.0) * (MU_BARY / root.powi(3)) * tau1.powi(3);
+//         let g3 = tau3 - (1.0 / 6.0) * (MU_BARY / root.powi(3)) * tau3.powi(3);
+
+//         let v2 = (-f3 * r1 + f1 * r3) / (f1 * g3 - f3 * g1);
+
+//         let x = r2.x;
+//         let y = r2.y;
+//         let z = r2.z;
+//         let vx = v2.x;
+//         let vy = v2.y;
+//         let vz = v2.z;
+
+//         let ltt = r2.norm() / SPEED_OF_LIGHT;
+//         let corrected_t = triplet[1].epoch - ltt;
+//         let corrected_epoch = Time::new(corrected_t, "tdb", "jd").unwrap();
+//         let rock =
+//             SpaceRock::from_xyz("rock", x, y, z, vx, vy, vz, corrected_epoch, "J2000", "SSb")
+//                 .expect("Failed to create SpaceRock from XYZ");
+//         res.push(rock);
+//     }
+
+//     return Some(res);
+// }
+
+
+// use std::collections::{BTreeSet, HashMap};
+
+// #[derive(Debug)]
+// pub struct SortedGroups {
+//     pub groups: HashMap<usize, BTreeSet<usize>>,
+//     pub membership: HashMap<usize, BTreeSet<usize>>,
+// }
+
+// impl SortedGroups {
+//     pub fn new() -> Self {
+//         Self {
+//             groups: HashMap::new(),
+//             membership: HashMap::new(),
+//         }
+//     }
+
+//     /// Check if a group ID exists in the collection
+//     pub fn has_group(&self, group_id: usize) -> bool {
+//         self.groups.contains_key(&group_id)
+//     }
+
+//     /// Insert a list of integers into a group (duplicates are ignored, order irrelevant)
+//     pub fn insert_many(&mut self, group_id: usize, values: &[usize]) {
+//         let group = self.groups.entry(group_id).or_insert_with(BTreeSet::new);
+//         for &value in values {
+//             group.insert(value);
+//             self.membership
+//                 .entry(value)
+//                 .or_insert_with(BTreeSet::new)
+//                 .insert(group_id);
+//         }
+//     }
+
+//     /// Remove specific integers from a group
+//     pub fn remove_many(&mut self, group_id: usize, values: &[usize]) {
+//         let mut remove_group = false;
+
+//         if let Some(group) = self.groups.get_mut(&group_id) {
+//             for &value in values {
+//                 group.remove(&value);
+//                 if let Some(groups) = self.membership.get_mut(&value) {
+//                     groups.remove(&group_id);
+//                     if groups.is_empty() {
+//                         self.membership.remove(&value);
+//                     }
+//                 }
+//             }
+//             if group.is_empty() {
+//                 remove_group = true;
+//             }
+//         }
+
+//         if remove_group {
+//             self.groups.remove(&group_id);
+//         }
+//     }
+
+//     /// Remove an entire group and clean up membership references
+//     pub fn remove_group(&mut self, group_id: usize) {
+//         if let Some(values) = self.groups.remove(&group_id) {
+//             for value in values {
+//                 if let Some(groups) = self.membership.get_mut(&value) {
+//                     groups.remove(&group_id);
+//                     if groups.is_empty() {
+//                         self.membership.remove(&value);
+//                     }
+//                 }
+//             }
+//         }
+//     }
+
+//     /// Check if an existing group (by ID) is a proper subset of any other stored group
+//     pub fn is_subset_of_any(&self, target_id: usize) -> Option<(bool, Option<usize>)> {
+//         let target_set = self.groups.get(&target_id)?;
+//         self._is_subset_of_any_internal(target_set, Some(target_id))
+//     }
+
+//     /// Check if an arbitrary list of integers is a proper subset of any stored group
+//     pub fn is_subset_of_any_values(&self, values: &[usize]) -> Option<(bool, Option<usize>)> {
+//         if values.is_empty() {
+//             return Some((false, None));
+//         }
+//         let target_set: BTreeSet<usize> = values.iter().cloned().collect();
+//         self._is_subset_of_any_internal(&target_set, None)
+//     }
+
+//     /// Internal helper used by both subset-check methods
+//     fn _is_subset_of_any_internal(
+//         &self,
+//         target_set: &BTreeSet<usize>,
+//         exclude_id: Option<usize>,
+//     ) -> Option<(bool, Option<usize>)> {
+//         if target_set.is_empty() {
+//             return Some((false, None));
+//         }
+
+//         // Collect candidate groups that share at least one element
+//         let mut candidate_groups = BTreeSet::new();
+//         for value in target_set {
+//             if let Some(groups) = self.membership.get(value) {
+//                 for g in groups {
+//                     if Some(*g) != exclude_id {
+//                         candidate_groups.insert(*g);
+//                     }
+//                 }
+//             }
+//         }
+
+//         // Check if target_set is a proper subset of any candidate
+//         for group_id in candidate_groups {
+//             if let Some(candidate) = self.groups.get(&group_id) {
+//                 if target_set.is_subset(candidate) && target_set != candidate {
+//                     return Some((true, Some(group_id)));
+//                 }
+//             }
+//         }
+
+//         Some((false, None))
+//     }
+
+//     /// NEW: Check if a given (unsorted, possibly duplicate) group of integers
+//     /// exactly matches any existing stored group. Returns its group ID if found.
+//     pub fn find_existing_group(&self, values: &[usize]) -> Option<usize> {
+//         if values.is_empty() {
+//             return None;
+//         }
+//         let candidate: BTreeSet<usize> = values.iter().cloned().collect();
+//         for (group_id, group_values) in &self.groups {
+//             if *group_values == candidate {
+//                 return Some(*group_id);
+//             }
+//         }
+//         None
+//     }
+// }
+
+
+
+// // file i/o
+// use csv;
+// use std::fs::File;
+// use std::io;
+// use std::io::Write;
+
+// // timing
+// use std::time::Instant;
+
+// use cdshealpix::nested::{get, Layer};
+// use cdshealpix::{TRANSITION_LATITUDE};
+
+// use cdshealpix::{nside};
+// use cdshealpix::nested;
+
+
+// // tunable parameter
+// const MAX_DT: f64 = 4000.0;
+// const MIN_UNIQUE_TIMES: usize = 12;
+// const MIN_POINTS_PER_CELL: usize = 12;
+// const MIN_NIGHTS: usize = 4;
+
+// const EPS: f64 = 60.0 / ARCSEC_PER_RAD; // 45.0 / ARCSEC_PER_RAD;
+// const EPS_SMALL: f64 = 4.0 / ARCSEC_PER_RAD; // 45.0 / ARCSEC_PER_RAD;
+// const SEP_THRESH: f64 = 4.0;
+
+// // --- Constants ---
+
+// const ARCSEC_PER_HOUR_TO_RAD_PER_DAY: f64 = (24.0 / 3600.0) * PI / 180.0;
+// const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / PI;
+// // const SPEED_OF_LIGHT: f64 = 173.14463268466926;
+
+// // --- Utility Functions ---
+
+// fn nice_acos(x: f64) -> f64 {
+//     x.clamp(-1.0, 1.0).acos()
+// }
+
+// fn chebyshev_eval(c: &[f64], x: f64) -> f64 {
+//     if c.is_empty() {
+//         return 0.0;
+//     }
+//     let mut sum = c[0];
+//     if c.len() >= 2 {
+//         sum += c[1] * x;
+//     }
+//     let mut t_prev = 1.0;
+//     let mut t_curr = x;
+//     for k in 2..c.len() {
+//         let t_next = 2.0 * x * t_curr - t_prev;
+//         sum += c[k] * t_next;
+//         t_prev = t_curr;
+//         t_curr = t_next;
+//     }
+//     sum
+// }
+
+// fn fit_chebyshev_direct(xs: &[f64], ys: &[f64], degree: usize) -> Vec<f64> {
+//     use nalgebra::{DMatrix, DVector};
+
+//     let n = xs.len();
+//     let mut vander = DMatrix::zeros(n, degree + 1);
+//     let mut y_vec = DVector::from_element(n, 0.0);
+
+//     for (i, &x) in xs.iter().enumerate() {
+//         let mut t_prev = 1.0;
+//         let mut t_curr = x;
+//         vander[(i, 0)] = t_prev;
+
+//         if degree >= 1 {
+//             vander[(i, 1)] = t_curr;
+//         }
+//         for k in 2..=degree {
+//             let t_next = 2.0 * x * t_curr - t_prev;
+//             vander[(i, k)] = t_next;
+//             t_prev = t_curr;
+//             t_curr = t_next;
+//         }
+//         y_vec[i] = ys[i];
+//     }
+
+//     let vt_v = &vander.transpose() * &vander;
+//     let vt_y = &vander.transpose() * &y_vec;
+
+//     let coeffs = vt_v.lu().solve(&vt_y).expect("Singular matrix");
+
+//     coeffs.iter().copied().collect()
+// }
+
+// // --- Detection ---
+// pub struct Detection {
+//     intid: i32,
+//     rho_hat: Vector3<f64>,
+//     astrom_sig: f64,
+//     observer_position: Vector3<f64>,
+//     observer_velocity: Vector3<f64>,
+//     epoch: f64,
+//     rho_hat_dot_observer_position: f64,
+//     observer_distance_squared: f64,
+//     detID: String,
+//     filt: String,
+//     mag: f64,
+//     mag_sig: f64,
+//     exposure_id: i32,
+// }
+
+// impl Detection {
+//     pub fn new(
+//         intid: i32,
+//         ra: f64,
+//         dec: f64,
+//         astrom_sig: f64,
+//         epoch: Time,
+//         observer_position: Vector3<f64>,
+//         observer_velocity: Vector3<f64>,
+//         detID: String,
+//         filt: String,
+//         mag: f64,
+//         mag_sig: f64,
+//         exposure_id: i32,
+//     ) -> Self {
+//         let rho_hat = Vector3::new(ra.cos() * dec.cos(), ra.sin() * dec.cos(), dec.sin());
+
+//         let epoch_jd = epoch.tdb().jd();
+
+//         let rho_hat_dot_observer_position = rho_hat.dot(&observer_position);
+
+//         let observer_distance_squared = observer_position.iter().map(|&v| v * v).sum();
+
+//         Detection {
+//             intid,
+//             rho_hat,
+//             astrom_sig,
+//             observer_position,
+//             observer_velocity,
+//             epoch: epoch_jd,
+//             rho_hat_dot_observer_position,
+//             observer_distance_squared,
+//             detID,
+//             filt,
+//             mag,
+//             mag_sig,
+//             exposure_id, 
+//         }
+//     }
+// }
+
+// // --- InitialCondition ---
+// #[derive(Debug)]
+// pub struct InitialCondition {
+//     id: String,
+//     r: f64,
+//     vr: f64,
+//     vo: f64,
+//     inc: f64,
+//     kappa: i32,
+//     epoch: f64,
+//     mu: f64,
+//     h: f64,
+//     alpha: f64,
+//     interpolation_bounds: f64,
+//     r_poly: Vec<f64>,
+//     vr_poly: Vec<f64>,
+//     f_poly: Vec<f64>,
+//     g_poly: Vec<f64>,
+// }
+
+// impl InitialCondition {
+//     pub fn from_elements(
+//         id: String,
+//         q: f64,
+//         e: f64,
+//         inc: f64,
+//         true_anomaly: f64,
+//         kappa: i32,
+//         epoch: Time,
+//         mu: f64,
+//     ) -> Result<Self, Box<dyn std::error::Error>> {
+//         if e > 1.0 {
+//             if true_anomaly.abs() > nice_acos(-1.0 / e) {
+//                 panic!("True anomaly out of bounds for eccentricity.");
+//             }
+//         }
+
+//         let p = q * (1.0 + e);
+//         let h = (p * mu).sqrt();
+//         let r0 = p / (1.0 + e * true_anomaly.cos());
+//         let vo = h / r0;
+//         let vr = (mu / h) * e * true_anomaly.sin();
+
+//         Self::from_spherical(id, r0, vr, vo, inc, kappa, epoch, mu)
+//     }
+
+//     pub fn from_keplerian(
+//         id: String,
+//         q: f64,
+//         e: f64,
+//         inc: f64,
+//         mean_anomaly: f64,
+//         kappa: i32,
+//         epoch: Time,
+//         mu: f64,
+//     ) -> Result<Self, Box<dyn std::error::Error>> {
+
+//         let mean_anomaly = principal_value(mean_anomaly);
+//         //println!("Calculating true anomaly from mean anomaly: e = {}, M = {}", e, mean_anomaly);
+//         let true_anomaly = calc_true_anomaly_from_mean_anomaly(e, mean_anomaly).unwrap();
+//         //let eccentric_anomaly = solve_kepler(mean_anomaly, e, EPSILON)?;
+//         //let true_anomaly = true_anomaly_from_eccentric(mean_anomaly, e).unwrap();
+
+//         //println!("KE = {:.3e}", mean_anomaly - (eccentric_anomaly - e * eccentric_anomaly.sin()));
+
+//         let p = q * (1.0 + e);
+//         let h = (p * mu).sqrt();
+//         let r0 = p / (1.0 + e * true_anomaly.cos());
+//         let vo = h / r0;
+//         let vr = (mu / h) * e * true_anomaly.sin();
+
+//         Self::from_spherical(id, r0, vr, vo, inc, kappa, epoch, mu)
+//         //Self::from_spherical(id, r0, vr, vo, 0.0, kappa, epoch, mu)
+//     }
+
+//     pub fn from_spherical(
+//         id: String,
+//         r: f64,
+//         vr: f64,
+//         vo: f64,
+//         inc: f64,
+//         kappa: i32,
+//         epoch: Time,
+//         mu: f64,
+//     ) -> Result<Self, Box<dyn std::error::Error>> {
+//         let epoch_jd = epoch.tdb().jd();
+//         let h = r * vo;
+//         let energy = 0.5 * (vr * vr + vo * vo) - mu / r;
+//         let alpha = -2.0 * energy / mu;
+
+//         // This should be more flexible, rather than hard-coded.
+//         let interpolation_bounds = 4.0 * 365.25;
+
+//         let dt_values: Vec<f64> = (-interpolation_bounds as i32..=interpolation_bounds as i32)
+//             .step_by(7)
+//             .map(|v| v as f64)
+//             .collect();
+
+//         let mut s_values = Vec::new();
+//         // This could be inverted, so that the values of s are the independent variable
+//         // and the dt values are computed from them.
+//         for &dt in &dt_values {
+//             let s = solve_for_universal_anomaly(r, vr, alpha, mu, dt, 1e-12, 100)?;
+//             s_values.push(s);
+//         }
+
+//         let stumpff_c_values: Vec<f64> =
+//             s_values.iter().map(|&s| stumpff_c(alpha * s * s)).collect();
+//         let stumpff_s_values: Vec<f64> =
+//             s_values.iter().map(|&s| stumpff_s(alpha * s * s)).collect();
+
+//         let f_values: Vec<f64> = s_values
+//             .iter()
+//             .zip(stumpff_c_values.iter())
+//             .map(|(&s, &c)| 1.0 - s * s / r * c)
+//             .collect();
+
+//         let g_values: Vec<f64> = s_values
+//             .iter()
+//             .zip(stumpff_s_values.iter())
+//             .enumerate()
+//             .map(|(i, (&s, &sval))| {
+//                 let dt = dt_values[i];
+//                 dt - s.powi(3) / mu.sqrt() * sval
+//             })
+//             .collect();
+
+//         let rsq_values: Vec<f64> = f_values
+//             .iter()
+//             .zip(g_values.iter())
+//             .map(|(&f, &g)| {
+//                 f.powi(2) * r.powi(2) + 2.0 * f * g * r * vr + g.powi(2) * (vo.powi(2) + vr.powi(2))
+//             })
+//             .collect();
+
+//         let r_values: Vec<f64> = rsq_values.iter().map(|&val| val.sqrt()).collect();
+
+//         let fdot_values: Vec<f64> = s_values
+//             .iter()
+//             .zip(r_values.iter())
+//             .zip(stumpff_s_values.iter())
+//             .map(|((&s, &rval), &sval)| s * mu.sqrt() / (r * rval) * (alpha * s * s * sval - 1.0))
+//             .collect();
+
+//         let gdot_values: Vec<f64> = s_values
+//             .iter()
+//             .zip(r_values.iter())
+//             .zip(stumpff_c_values.iter())
+//             .map(|((&s, &rval), &c)| 1.0 - s * s / rval * c)
+//             .collect();
+
+//         let r_vr_values: Vec<f64> = f_values
+//             .iter()
+//             .zip(fdot_values.iter())
+//             .map(|(&f, &fdot)| f * fdot * r * r)
+//             .zip(
+//                 g_values
+//                     .iter()
+//                     .zip(gdot_values.iter())
+//                     .map(|(&g, &gdot)| g * gdot * (vo * vo + vr * vr)),
+//             )
+//             .zip(
+//                 f_values
+//                     .iter()
+//                     .zip(gdot_values.iter())
+//                     .zip(g_values.iter().zip(fdot_values.iter()))
+//                     .map(|((&f, &gdot), (&g, &fdot))| r * vr * (f * gdot + g * fdot)),
+//             )
+//             .map(|((a, b), c)| a + b + c)
+//             .collect();
+
+//         let vr_values: Vec<f64> = r_vr_values
+//             .iter()
+//             .zip(r_values.iter())
+//             .map(|(&rv, &rval)| rv / rval)
+//             .collect();
+
+//         let scaled_dt_values: Vec<f64> = dt_values
+//             .iter()
+//             .map(|&dt| dt / interpolation_bounds)
+//             .collect();
+
+//         let r_poly = fit_chebyshev_direct(&scaled_dt_values, &r_values, 3);
+//         let vr_poly = fit_chebyshev_direct(&scaled_dt_values, &vr_values, 3);
+//         let f_poly = fit_chebyshev_direct(&scaled_dt_values, &f_values, 3);
+//         let g_poly = fit_chebyshev_direct(&scaled_dt_values, &g_values, 3);
+
+//         Ok(InitialCondition {
+//             id,
+//             r,
+//             vr,
+//             vo,
+//             inc,
+//             kappa,
+//             epoch: epoch_jd,
+//             mu,
+//             h,
+//             alpha,
+//             interpolation_bounds,
+//             r_poly,
+//             vr_poly,
+//             f_poly,
+//             g_poly,
+//         })
+//     }
+
+//     fn r_at_epoch(&self, epoch: f64) -> f64 {
+//         let dt = epoch - self.epoch;
+//         let scaled_dt = dt / self.interpolation_bounds;
+//         chebyshev_eval(&self.r_poly, scaled_dt)
+//     }
+
+//     fn vr_at_epoch(&self, epoch: f64) -> f64 {
+//         let dt = epoch - self.epoch;
+//         let scaled_dt = dt / self.interpolation_bounds;
+//         chebyshev_eval(&self.vr_poly, scaled_dt)
+//     }
+
+//     fn f_at_epoch(&self, epoch: f64) -> f64 {
+//         let dt = epoch - self.epoch;
+//         let scaled_dt = dt / self.interpolation_bounds;
+//         chebyshev_eval(&self.f_poly, scaled_dt)
+//     }
+
+//     fn g_at_epoch(&self, epoch: f64) -> f64 {
+//         let dt = epoch - self.epoch;
+//         let scaled_dt = dt / self.interpolation_bounds;
+//         chebyshev_eval(&self.g_poly, scaled_dt)
+//     }
+// }
+
+// #[derive(Debug)]
+// struct FitResult {
+//     params: [f64; 5],  // a, b, c, d, e
+//     cov: DMatrix<f64>, // 5×5 covariance matrix
+//     sigma: f64,
+//     r2: f64,
+//     chi2: f64,
+//     dof: f64,
+// }
+
+// /// Weighted coupled least squares with explicit error handling.
+// fn coupled_weighted_fit(
+//     t: &[f64],
+//     f: &[f64],
+//     g: &[f64],
+//     x: &[f64],
+//     y: &[f64],
+//     sigma_x: &[f64],
+//     sigma_y: &[f64],
+// ) -> Result<FitResult, String> {
+//     let n = t.len();
+//     if n < 3 {
+//         return Err("Not enough data points to fit.".into());
+//     }
+
+//     // Build design matrix (2n × 5) and observation vector (2n)
+//     let mut xmat = DMatrix::<f64>::zeros(2 * n, 5);
+//     let mut yvec = DVector::<f64>::zeros(2 * n);
+//     let mut w = DVector::<f64>::zeros(2 * n); // inverse variance weights
+
+//     for i in 0..n {
+//         // x_i = a + b*t + c*f
+//         xmat[(i, 0)] = 1.0;
+//         xmat[(i, 1)] = t[i];
+//         xmat[(i, 2)] = f[i];
+//         yvec[i] = x[i];
+//         w[i] = 1.0 / sigma_x[i].powi(2);
+
+//         // y_i = d + e*t + c*g
+//         let j = n + i;
+//         xmat[(j, 2)] = g[i];
+//         xmat[(j, 3)] = 1.0;
+//         xmat[(j, 4)] = t[i];
+//         yvec[j] = y[i];
+//         w[j] = 1.0 / sigma_y[i].powi(2);
+//     }
+
+//     let w_diag = DMatrix::from_diagonal(&w);
+//     let xtwx = xmat.transpose() * &w_diag * &xmat;
+//     let xtwy = xmat.transpose() * &w_diag * &yvec;
+
+//     // Try to invert (XᵀWX)
+//     let xtwx_inv = xtwx.try_inverse().ok_or_else(|| {
+//         "Matrix (XᵀWX) is singular or ill-conditioned — cannot perform fit.".to_string()
+//     })?;
+
+//     // Solve for parameters
+//     let beta = &xtwx_inv * xtwy;
+//     let params = [beta[0], beta[1], beta[2], beta[3], beta[4]];
+
+//     // Compute residuals and statistics
+//     let y_hat = &xmat * &beta;
+//     let r = &yvec - y_hat;
+//     let chi2 = r.iter().zip(w.iter()).map(|(&ri, &wi)| wi * ri.powi(2)).sum::<f64>();
+//     let dof = (2 * n) as f64 - 5.0;
+//     if dof <= 0.0 {
+//         return Err("Not enough degrees of freedom.".into());
+//     }
+
+//     let sigma2 = chi2 / dof;
+//     let cov = &xtwx_inv * sigma2;
+
+//     // Weighted R²
+//     let mean_y = yvec.iter().zip(w.iter()).map(|(&yi, &wi)| wi * yi).sum::<f64>() / w.sum();
+//     let ss_tot = yvec
+//         .iter()
+//         .zip(w.iter())
+//         .map(|(&yi, &wi)| wi * (yi - mean_y).powi(2))
+//         .sum::<f64>();
+//     let r2 = 1.0 - chi2 / ss_tot;
+
+//     Ok(FitResult {
+//         params,
+//         cov,
+//         sigma: sigma2.sqrt(),
+//         r2,
+//         chi2,
+//         dof,
+//     })
+// }
+
+// /// Iteratively reject the single largest outlier until |pull| < threshold or min_points reached.
+// fn iterative_reject(
+//     t: &[f64],
+//     f: &[f64],
+//     g: &[f64],
+//     x: &[f64],
+//     y: &[f64],
+//     sigma_x: &[f64],
+//     sigma_y: &[f64],
+//     pull_threshold: f64,
+//     min_points: usize,
+// ) -> Result<(FitResult, Vec<usize>, Vec<usize>), String> {
+//     assert!(t.len() == f.len() && t.len() == g.len());
+//     let mut keep: Vec<usize> = (0..t.len()).collect();
+//     let mut rejected: Vec<usize> = Vec::new();
+
+//     loop {
+//         // Subset data
+//         let t_f: Vec<f64> = keep.iter().map(|&i| t[i]).collect();
+
+//         let mut t_n: Vec<i64> = t_f.iter().map(|&ti| ti.round() as i64).collect();
+//         t_n.sort_unstable();
+//         t_n.dedup();
+
+//         let f_f: Vec<f64> = keep.iter().map(|&i| f[i]).collect();
+//         let g_f: Vec<f64> = keep.iter().map(|&i| g[i]).collect();
+//         let x_f: Vec<f64> = keep.iter().map(|&i| x[i]).collect();
+//         let y_f: Vec<f64> = keep.iter().map(|&i| y[i]).collect();
+//         let sx_f: Vec<f64> = keep.iter().map(|&i| sigma_x[i]).collect();
+//         let sy_f: Vec<f64> = keep.iter().map(|&i| sigma_y[i]).collect();
+
+//         if t_n.len() < MIN_NIGHTS {
+//             return Err(format!(
+//                 "Stopped: not enough unique observation times left ({} < {}).",
+//                 t_n.len(),
+//                 MIN_UNIQUE_TIMES
+//             ));
+//         }
+//         // Perform fit
+//         let fit = match coupled_weighted_fit(&t_f, &f_f, &g_f, &x_f, &y_f, &sx_f, &sy_f) {
+//             Ok(fit) => fit,
+//             Err(e) => {
+//                 eprintln!("Fit failed: {e}");
+//                 return Err(format!("Fit failed after rejecting {} points: {}", rejected.len(), e));
+//             }
+//         };
+
+//         // Compute pulls
+//         let mut worst_i_local: Option<usize> = None;
+//         let mut worst_pull = 0.0;
+//         for (i, &ti) in t_f.iter().enumerate() {
+//             let xi_model = fit.params[0] + fit.params[1] * ti + fit.params[2] * f_f[i];
+//             let yi_model = fit.params[3] + fit.params[4] * ti + fit.params[2] * g_f[i];
+//             let pull_x = (x_f[i] - xi_model) / sx_f[i];
+//             let pull_y = (y_f[i] - yi_model) / sy_f[i];
+//             let pull_mag = pull_x.abs().max(pull_y.abs());
+//             if pull_mag > worst_pull {
+//                 worst_pull = pull_mag;
+//                 worst_i_local = Some(i);
+//             }
+//         }
+
+//         // Stop if all points are within threshold
+//         if worst_pull < pull_threshold {
+//             return Ok((fit, keep, rejected));
+//         }
+
+//         // Reject the worst point
+//         if let Some(local_i) = worst_i_local {
+//             let global_i = keep[local_i];
+//             /*
+//             println!(
+//                 "Rejecting point {} with |pull| = {:.2} (remaining: {})",
+//                 global_i,
+//                 worst_pull,
+//                 keep.len() - 1
+//             );
+//             */
+            
+//             rejected.push(global_i);
+//             keep.remove(local_i);
+//         }
+
+//         // Stop if not enough data left
+//         if keep.len() < min_points {
+//             return Err(format!(
+//                 "Stopped: not enough points left ({} < {}).",
+//                 keep.len(),
+//                 min_points
+//             ));
+//         }
+//     }
+// }
+
+
+// /// Iteratively reject a fraction of the worst outliers (by |pull|) per iteration.
+// fn iterative_fraction_reject(
+//     t: &[f64],
+//     f: &[f64],
+//     g: &[f64],
+//     x: &[f64],
+//     y: &[f64],
+//     sigma_x: &[f64],
+//     sigma_y: &[f64],
+//     pull_threshold: f64,
+//     fraction: f64, // e.g. 0.10 for 10%
+//     min_points: usize,
+// ) -> Result<(FitResult, Vec<usize>, Vec<usize>), String> {
+//     assert!(fraction > 0.0 && fraction < 1.0);
+//     assert!(t.len() == f.len() && t.len() == g.len());
+//     let mut keep: Vec<usize> = (0..t.len()).collect();
+//     let mut rejected: Vec<usize> = Vec::new();
+
+//     loop {
+//         // Subset data
+//         let t_f: Vec<f64> = keep.iter().map(|&i| t[i]).collect();
+//         let f_f: Vec<f64> = keep.iter().map(|&i| f[i]).collect();
+//         let g_f: Vec<f64> = keep.iter().map(|&i| g[i]).collect();
+//         let x_f: Vec<f64> = keep.iter().map(|&i| x[i]).collect();
+//         let y_f: Vec<f64> = keep.iter().map(|&i| y[i]).collect();
+//         let sx_f: Vec<f64> = keep.iter().map(|&i| sigma_x[i]).collect();
+//         let sy_f: Vec<f64> = keep.iter().map(|&i| sigma_y[i]).collect();
+
+//         let fit = match coupled_weighted_fit(&t_f, &f_f, &g_f, &x_f, &y_f, &sx_f, &sy_f) {
+//             Ok(fit) => fit,
+//             Err(e) => {
+//                 return Err(format!("Fit failed after rejecting {} points: {}", rejected.len(), e));
+//             }
+//         };
+
+//         // Compute pulls
+//         let mut pulls: Vec<(usize, f64)> = Vec::with_capacity(t_f.len());
+//         for (i, &ti) in t_f.iter().enumerate() {
+//             let xi_model = fit.params[0] + fit.params[1] * ti + fit.params[2] * f_f[i];
+//             let yi_model = fit.params[3] + fit.params[4] * ti + fit.params[2] * g_f[i];
+//             let pull_x = (x_f[i] - xi_model) / sx_f[i];
+//             let pull_y = (y_f[i] - yi_model) / sy_f[i];
+//             let pull_mag = pull_x.abs().max(pull_y.abs());
+//             pulls.push((i, pull_mag));
+//         }
+
+//         // Check if all points are within threshold
+//         let worst_pull = pulls.iter().map(|(_, p)| *p).fold(0.0, f64::max);
+//         if worst_pull < pull_threshold {
+//             //println!("All pulls < {:.2}. Stopping.", pull_threshold);
+//             return Ok((fit, keep, rejected));
+//         }
+
+//         // Sort by pull magnitude descending
+//         pulls.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+//         // Determine how many to reject
+//         let mut n_reject = (fraction * (keep.len() as f64)).ceil() as usize;
+//         n_reject = n_reject.min(keep.len().saturating_sub(min_points));
+//         n_reject = n_reject.max(1); //  always reject at least one
+        
+
+
+//         // Reject worst fraction
+//         /*
+//         println!(
+//             "Rejecting {} points (fraction {:.1}%) with max |pull| = {:.2}",
+//             n_reject,
+//             fraction * 100.0,
+//             worst_pull
+//         );
+//         */
+
+//         for (i_local, _) in pulls.iter().take(n_reject) {
+//             rejected.push(keep[*i_local]);
+//         }
+
+//         // Keep only inliers
+//         let reject_set: std::collections::HashSet<_> = rejected.iter().copied().collect();
+//         keep.retain(|idx| !reject_set.contains(idx));
+
+//         if keep.len() < min_points {
+//             return Err(format!(
+//                 "Stopped: not enough points left ({} < {}).",
+//                 keep.len(),
+//                 min_points
+//             ));
+//         }
+//     }
+// }
+
+
+// // --- Orbit Sync ---
+
+// fn cost_and_gradient(det: &Detection, ic: &InitialCondition, rho: f64) -> (f64, f64, f64) {
+//     let ltt = rho / SPEED_OF_LIGHT;
+//     let ep = det.epoch - ltt;
+//     let r = ic.r_at_epoch(ep);
+
+//     let cost = r * r
+//         - rho * rho
+//         - 2.0 * rho * det.rho_hat_dot_observer_position
+//         - det.observer_distance_squared;
+//     let grad = -2.0 * (rho + det.rho_hat_dot_observer_position);
+
+//     (cost, grad, r)
+// }
+
+// fn optimize_rho(det: &Detection, ic: &InitialCondition, rho0: f64) -> (f64, f64) {
+//     // tunable parameter
+//     let tol = 1e-8;
+//     let mut rho = rho0;
+//     let (mut cost, mut grad, mut r) = cost_and_gradient(det, ic, rho);
+//     while cost.abs() > tol {
+//         if grad == 0.0 {
+//             break;
+//         }
+//         rho -= cost / grad;
+//         let (c, g, new_r) = cost_and_gradient(det, ic, rho);
+//         cost = c;
+//         grad = g;
+//         r = new_r;
+//     }
+//     (rho, r)
+// }
+
+// pub fn sync_detection_to_orbit(det: &Detection, ic: &InitialCondition) -> Option<[f64; 3]> {
+//     let (rho, r) = optimize_rho(det, ic, ic.r - 1.0);
+
+//     let r_vec = det.observer_position + rho * det.rho_hat;
+
+//     let light_corrected_epoch = det.epoch - rho / SPEED_OF_LIGHT;
+//     if (r_vec[2].abs() / r) > ic.inc.sin() {
+//         return None;
+//     }
+
+//     let (x, y, z) = (r_vec[0], r_vec[1], r_vec[2]);
+//     let xy_norm = (x * x + y * y).sqrt();
+
+//     let ahat = Vector3::new(-y / xy_norm, x / xy_norm, 0.0);
+//     let dhat = Vector3::new(-z * x / (r * xy_norm), -z * y / (r * xy_norm), xy_norm / r);
+
+//     let cos_theta = xy_norm / r;
+
+//     let vo = ic.h / r;
+//     let vr = ic.vr_at_epoch(light_corrected_epoch);
+//     let cos_psi = ic.inc.cos() / cos_theta;
+//     let sin_psi = ic.kappa as f64 * (1.0 - cos_psi * cos_psi).sqrt();
+
+//     let v_vec = vr * r_vec / r + vo * (cos_psi * ahat + sin_psi * dhat);
+
+//     let f = ic.f_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
+//     let g = ic.g_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
+//     let new_position = r_vec * f + v_vec * g;
+
+//     let new_pointing = new_position / ic.r;
+//     Some([new_pointing[0], new_pointing[1], new_pointing[2]])
+// }
+
+// pub fn sync_detection_to_orbit_with_time(det: &Detection, ic: &InitialCondition) -> Option<([f64; 3], f64)> {
+//     let (rho, r) = optimize_rho(det, ic, ic.r - 1.0); // Keep in mind that there can be multiple solutions, but not for TNOs.
+
+//     let r_vec = det.observer_position + rho * det.rho_hat;
+
+//     let light_corrected_epoch = det.epoch - rho / SPEED_OF_LIGHT;
+        
+//     //if ((r_vec[2] / r).asin()).abs() > ic.inc {
+//     //
+//     //     return None;
+//     //}
+
+//     if (r_vec[2] / r).abs() > ic.inc.sin().abs() {
+//         return None;
+//     }
+
+//     let (x, y, z) = (r_vec[0], r_vec[1], r_vec[2]);
+//     let xy_norm = (x * x + y * y).sqrt();
+
+//     let ahat = Vector3::new(-y / xy_norm, x / xy_norm, 0.0);
+//     let dhat = Vector3::new(-z * x / (r * xy_norm), -z * y / (r * xy_norm), xy_norm / r);
+
+//     let cos_theta = xy_norm / r;
+    
+//     let vo = ic.h / r;
+//     let vr = ic.vr_at_epoch(light_corrected_epoch);
+//     let cos_psi = ic.inc.cos() / cos_theta;
+//     let sin_psi = ic.kappa as f64 * (1.0 - cos_psi * cos_psi).sqrt();
+    
+//     let v_vec = vr * r_vec / r + vo * (cos_psi * ahat + sin_psi * dhat);
+    
+//     let f = ic.f_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
+//     let g = ic.g_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
+//     let new_position = r_vec * f + v_vec * g;
+
+//     let new_pointing = new_position / ic.r;
+//     Some(([new_pointing[0], new_pointing[1], new_pointing[2]], light_corrected_epoch))
+// }
+
+// fn linear_fit(
+//     t_data: &DVector<f64>,
+//     y_data: &DMatrix<f64>,
+//     weights: &DVector<f64>,
+// ) -> (DMatrix<f64>, DMatrix<f64>) {
+//     let num_points = t_data.len();
+
+//     // Build a_matrix
+//     // Column 0 for t values, Column 1 for y values (ones)
+//     let mut a_matrix = DMatrix::from_element(num_points, 2, 1.0);
+//     a_matrix.set_column(0, &t_data);
+
+//     // Construct the diagonal weighting matrix W
+//     let w_matrix = DMatrix::from_diagonal(&weights);
+
+//     // Calculate the weighted least squares solution for parameters (m, c)
+//     // The formula is: beta = (A^T * W * A)^-1 * A^T * W * y
+//     let at_w = a_matrix.transpose() * w_matrix;
+//     let at_w_a = &at_w * &a_matrix;
+
+//     // Need to handle errors more gracefully
+//     let cov = at_w_a.try_inverse().expect("Matrix inverse failed");
+//     let beta = &cov * &at_w * y_data;
+
+//     (beta, cov)
+// }
+
+// use std::f64::EPSILON;
+
+// /// Wrap a single angle (in radians) to the range [-pi, pi)
+// pub fn principal_value_0(theta: f64) -> f64 {
+//     let mut tc = theta - 2.0 * PI * (theta / (2.0 * PI)).floor();
+//     if tc >= PI {
+//         tc -= 2.0 * PI;
+//     }
+//     tc
+// }
+
+
+// /// Wraps an angle in radians to [0, 2 pi)
+// fn principal_value(theta: f64) -> f64 {
+//     let mut tc = theta - 2.0 * PI * (theta / (2.0 * PI)).floor();
+//     tc
+// }
+
+// // tunable parameter
+// const MAX_ITER: usize = 200;
+
+// /// Solve Kepler’s equation for eccentric anomaly `E` given mean anomaly and eccentricity.
+// ///
+// /// Returns `Some(E)` if converged, or `None` if the maximum iteration limit was reached.
+// pub fn solve_kepler(meananom: f64, e: f64, machine_epsilon: f64) -> Result<f64, Box<dyn std::error::Error>> {
+//     let meananom = principal_value(meananom);
+//     let mut n = 0;
+//     let mut e0 = meananom;
+//     let mut e1;
+//     let mut e2;
+//     let mut den;
+
+//     // --- Steffensen’s method ---
+//     loop {
+//         e1 = meananom + e * e0.sin();
+//         e2 = meananom + e * e1.sin();
+
+//         den = e2 - 2.0 * e1 + e0;
+//         if den.abs() > machine_epsilon {
+//             e0 -= (e1 - e0) * (e1 - e0) / den;
+//         } else {
+//             e0 = e2;
+//             e2 = e1;
+//         }
+
+//         n += 1;
+//         if (e0 - e2).abs() <= machine_epsilon {
+//             return Ok(e0);
+//         }
+//         if n >= MAX_ITER {
+//             break;
+//         }
+//     }
+
+//     // --- Fallback: simple fixed-point iteration ---
+//     //println!("Kepler solver: Steffensen's method failed to converge, falling back to fixed-point iteration.");
+//     n = 0;
+//     e1 = meananom;
+//     loop {
+//         e0 = e1;
+//         e1 = meananom + e * e0.sin();
+//         n += 1;
+
+//         if (e0 - e1).abs() <= machine_epsilon {
+//             return Ok(e1);
+//         }
+//         if n >= MAX_ITER {
+//             return Err("Convergence failure".into());   
+//         }
+//     }
+// }
+
+
+// /// Convert eccentric anomaly → true anomaly (radians)
+// /// Returns `Some(true_anomaly)` if valid (for 0 ≤ e < 1),
+// /// otherwise returns `None`.
+// pub fn true_anomaly_from_eccentric(eccanom: f64, e: f64) -> Option<f64> {
+//     if !(0.0..1.0).contains(&e) {
+//         return None; // Only defined for elliptical orbits
+//     }
+
+//     let denom = 1.0 - e;
+//     if denom <= 0.0 {
+//         return None; // Avoid division by zero or negative sqrt
+//     }
+
+//     let factor = ((1.0 + e) / denom).sqrt();
+//     let arg = (eccanom / 2.0).tan();
+
+//     if !arg.is_finite() || !factor.is_finite() {
+//         return None; // Numerical failure
+//     }
+
+//     let true_anom = 2.0 * (factor * arg).atan();
+
+//     // Wrap to [0, 2pi)
+//     Some(principal_value(true_anom))
+// }
+
+// pub struct LinearSolution {
+//     intid: i32,
+//     beta: DMatrix<f64>,
+//     cov: DMatrix<f64>,
+//     epoch: f64,
+// }
+
+// impl LinearSolution {
+//     pub fn from_vectors(
+//         intid: i32,
+//         t: &DVector<f64>,
+//         w: &DVector<f64>,
+//         xyz: &DMatrix<f64>,
+//     ) -> Self {
+//         let epoch = t[0];
+//         let x_data = &t;
+//         let weights = &w;
+//         let xyz_data = &xyz;
+
+//         let (beta, cov) = linear_fit(&x_data, &xyz_data, &weights);
+
+//         LinearSolution {
+//             intid,
+//             beta,
+//             cov,
+//             epoch,
+//         }
+//     }
+
+//     fn predict(&self, t_pred: &DVector<f64>) -> (DMatrix<f64>, DMatrix<f64>) {
+//         let mut a_predict = DMatrix::from_element(t_pred.len(), 2, 1.0);
+//         a_predict.set_column(0, &t_pred);
+//         let y_predicted: DMatrix<f64> = &a_predict * &self.beta;
+
+//         //println!("cov: {} a_predict: {} beta: {} y_predicted: {}", &self.cov, &a_predict, &self.beta, &y_predicted);
+
+//         let obs_cov: DMatrix<f64> = &a_predict * (&self.cov * &a_predict.transpose());
+
+//         (y_predicted, obs_cov)
+//     }
+// }
+
+// // --- Point ---
+// pub struct Point {
+//     intid: i32,
+//     vec: Vector3<f64>,
+//     astrom_sig: f64,
+//     epoch: f64,
+//     detID: String,
+//     theta_x: f64,
+//     theta_y: f64,
+// }
+
+// #[derive(Debug)]
+// pub struct Cluster {
+//     //intid: i32,
+//     ref_epoch: f64,
+//     local_intids: Vec<u64>,
+//     ref_point: [f64; 3],
+//     local_points: Vec<[f64; 3]>,
+//     local_thetas: Vec<[f64; 2]>,
+//     local_thetas_hash: HashMap<u64, [f64; 2]>,
+//     local_tree: KdTree<f64, 2>,
+//     local_obs_positions: Vec<Vector3<f64>>,
+//     unique_cluster_times: Vec<f64>,
+//     }
+    
+// impl Cluster {
+//     pub fn from_intids(
+//         central_intid: i32,
+//         local_intids: Vec<u64>,
+//         detections: &Vec<Detection>,
+//         central_point: [f64; 3],
+//         points: &Vec<[f64; 3]>,
+//     ) -> Self {
+//         let central_detection_epoch = detections[central_intid as usize].epoch;
+        
+//         let mut local_points: Vec<[f64; 3]> = local_intids
+//                 .iter()
+//                 .map(|&intid| points[intid as usize])
+//                 .collect();
+
+//         let full_times: Vec<f64> = local_intids
+//                 .iter()
+//                 .map(|&intid| detections[intid as usize].epoch - central_detection_epoch)
+//                 .collect();
+
+//         let mut unique_cluster_times = find_unique_f64_hashset(full_times.clone());
+        
+//         // Transform to local tangent plane coordinates.
+//         let point_vec = Vector3::new(central_point[0], central_point[1], central_point[2]);
+//         let mat = xyz_to_proj_matrix(point_vec);
+
+//         let mut test_points: Vec<Point> = Vec::new();
+//         let mut local_thetas: Vec<[f64; 2]> = Vec::new();
+//         let mut local_thetas_hash: HashMap<u64, [f64; 2]> = HashMap::new();
+//         let mut local_obs_positions: Vec<Vector3<f64>> = Vec::new();
+
+//         for (p, local_intid) in local_points
+//             .iter()
+//             .map(|&p| p)
+//             .zip(local_intids.iter().map(|&i| i as u64))
+//         {
+//             let det = &detections[local_intid as usize];
+//             let detID = det.detID.clone();
+
+//             let dt = det.epoch - central_detection_epoch;
+//             let p_vec = Vector3::new(p[0], p[1], p[2]);
+//             let longitude = p_vec[0].atan2(p_vec[1]);
+//             let latitude = p_vec[2].asin();
+//             let proj_vec = mat * p_vec;
+//             let theta_x = proj_vec[0] / proj_vec[2];
+//             let theta_y = proj_vec[1] / proj_vec[2];
+
+//             let position = det.observer_position.clone();
+//             let local_obs_pos = mat * position;
+//             local_obs_positions.push(local_obs_pos);
+
+//             let test_point: Point = Point {
+//                 intid: det.intid,
+//                 vec: Vector3::new(p[0], p[1], p[2]),
+//                 astrom_sig: det.astrom_sig,
+//                 epoch: det.epoch,
+//                 detID: detID.clone(),
+//                 theta_x: theta_x,
+//                 theta_y: theta_y,
+//             };
+//             test_points.push(test_point);   
+
+//             local_thetas.push([theta_x, theta_y]);
+//             local_thetas_hash.insert(local_intid as u64, [theta_x, theta_y]);
+//             println!("{:10} {:10.4} {:10.4} {:12.9} {:12.9} {:10.6} {}", local_intid, theta_x*206265., theta_y*206265., longitude, latitude, det.epoch, detID);
+//         }
+
+//         let mut local_tree: KdTree<f64, 2> = KdTree::with_capacity(10);
+//             local_tree.extend(
+//                 local_thetas
+//                     .iter()
+//                     .map(|&p| p)
+//                     .zip(local_intids.iter().map(|&i| i as u64)),
+//             );
+
+//         Cluster {
+//             //intid: central_intid,
+//             ref_epoch: central_detection_epoch,
+//             local_intids,
+//             ref_point: central_point,
+//             local_points,
+//             local_thetas,
+//             local_thetas_hash,
+//             local_tree,
+//             local_obs_positions,
+//             unique_cluster_times,
+//         }
+//     }
+// }
+
+// fn vet_tracklet(detections: &Vec<Detection>, intids: &Vec<usize>) -> bool {
+//     let dets: Vec<&Detection> = intids
+//         .iter()
+//         .map(|&intid| &detections[intid as usize])
+//         .collect();
+//     true
+// }
+
+// #[inline]
+// fn wrap_0_2pi(x: f64) -> f64 {
+//     // wraps angle into [0, 2π)
+//     let y = x % (2.0 * PI);
+//     if y < 0.0 { y + 2.0 * PI } else { y }
+// }
+// /// Convert equatorial (RA, Dec) → ecliptic (λ, β)
+// /// All angles in **radians**
+// pub fn equatorial_to_ecliptic(ra: f64, dec: f64, eps: f64) -> (f64, f64) {
+//     // Obliquity of the ecliptic (J2000)
+
+//     // Compute ecliptic longitude (λ) and latitude (β)
+//     let lambda = (ra.sin() * eps.cos() + dec.tan() * eps.sin()).atan2(ra.cos());
+//     let beta = (dec.sin() * eps.cos() - dec.cos() * eps.sin() * ra.sin()).asin();
+
+//     (lambda, beta)
+// }
+
+// /// Convert ecliptic (lambda, beta) -> equatorial (ra, dec).
+// /// Inputs/outputs are in radians.
+// /// Uses obliquity eps (radians).
+// pub fn ecliptic_to_equatorial(lam: f64, beta: f64, eps: f64) -> (f64, f64) {
+//     // sin(dec) = sin(beta)*cos(eps) + cos(beta)*sin(eps)*sin(lam)
+//     let sin_dec = beta.sin() * eps.cos() + beta.cos() * eps.sin() * lam.sin();
+//     let dec = sin_dec.asin();
+
+//     // ra = atan2( cos(beta)*sin(lam)*cos(eps) - sin(beta)*sin(eps), cos(beta)*cos(lam) )
+//     let y = beta.cos() * lam.sin() * eps.cos() - beta.sin() * eps.sin();
+//     let x = beta.cos() * lam.cos();
+//     let ra = wrap_0_2pi(y.atan2(x));
+
+//     (ra, dec)
+// }
+
+// fn print_type<T>(_: &T) {
+//     println!("{}", std::any::type_name::<T>());
+// }
+
+
+
+// fn cull_cluster(detections: &Vec<Detection>, intid_idx_hash: &HashMap<u64, usize>, points: &Vec<[f64; 3]>, point: [f64; 3], cluster: &Vec<NearestNeighbour<f64, u64>>, central_detection_epoch: f64) -> Option<Cluster> {
+
+//     // Prune detections that are not compatible with the parent/central detection.
+
+//     let mut cluster_hash = Vec::new();
+//     let mut min_epoch = f64::MAX;
+//     let mut max_epoch = f64::MIN;
+
+//     //println!("cluster size before cull: {}", cluster.len());
+
+//     for neighbor in cluster.clone().into_iter() {
+        
+//         let det = &detections[neighbor.item as usize];
+
+//         let dt = (det.epoch - central_detection_epoch).abs();
+//         let distance = neighbor.distance;
+
+//         // I'm not sure this is quite right.
+//         //let mut acceptable_distance = cluster_r2 * dt / max_dt + (eps / 20.) * (eps / 20.);
+
+//         // Another tunable parameter.
+//         //if distance > (acceptable_distance) * 1.1 {
+//         //    continue;
+//         //}
+
+//         //if dt == 0.0 {
+//         //    continue;
+//         //}
+
+//         if dt > MAX_DT {
+//             continue;
+//         }
+
+//         if det.epoch < min_epoch {
+//             min_epoch = det.epoch;
+//         }
+
+//         if det.epoch > max_epoch {
+//             max_epoch = det.epoch;
+//         }
+
+//         cluster_hash.push(neighbor.item as u64);
+
+//     }
+
+//     let duration = max_epoch - min_epoch;
+//     // Another tunable parameter.
+//     /*
+//     if duration < max_dt / 2.0 {
+//         //println!("too brief {} {} {}", duration, max_dt, cluster_detections.len());
+//         n_skipped += 1;
+//         continue;
+//     }
+//     */
+
+//     let cluster_times: Vec<f64> = cluster_hash
+//         .iter()
+//         .map(|&id| detections[id as usize].epoch - central_detection_epoch)
+//         .collect();
+
+//     let mut cluster_nights: Vec<i32> = cluster_times
+//         .iter()
+//         .map(|&x| x.round() as i32)
+//         .collect();
+
+//     cluster_nights.sort_unstable();
+//     cluster_nights.dedup();
+//     //println!("nights in cluster: {:?}", cluster_nights);
+
+//     if cluster_nights.len() < MIN_NIGHTS {
+//         //println!("too few nights: {:?}", cluster_nights.len());
+//         return None;
+//     }
+        
+
+//     let mut unique_cluster_times = find_unique_f64_hashset(cluster_times.clone());
+
+//     if unique_cluster_times.len() < MIN_UNIQUE_TIMES {
+//         //println!("small cluster: {:?}", unique_cluster_times.len());
+//         return None;
+//     }
+
+//     // Transform to local tangent plane coordinates.
+//     let point_vec = Vector3::new(point[0], point[1], point[2]);
+//     let mat = xyz_to_proj_matrix(point_vec);
+
+//     cluster_hash.sort();
+//     let mut local_intids: Vec<u64> = cluster_hash.iter().cloned().collect();
+
+//     let mut local_points: Vec<[f64; 3]> = local_intids
+//                 .iter()
+//                 .map(|intid| points[intid_idx_hash[intid]].clone())
+//                 .collect();
+
+//     let mut local_thetas: Vec<[f64; 2]> = Vec::new();
+//     let mut local_thetas_hash: HashMap<u64, [f64; 2]> = HashMap::new();
+//     let mut local_obs_positions: Vec<Vector3<f64>> = Vec::new();
+//     for (p, local_intid) in local_points
+//         .iter()
+//         .map(|&p| p)
+//         .zip(local_intids.iter().map(|&i| i as u64))
+//     {
+//         let det = &detections[local_intid as usize];
+//         let detID = det.detID.clone();
+
+//         let dt = det.epoch - central_detection_epoch;
+//         let p_vec = Vector3::new(p[0], p[1], p[2]);
+//         let longitude = p_vec[0].atan2(p_vec[1]);
+//         let latitude = p_vec[2].asin();
+//         let proj_vec = mat * p_vec;
+//         let theta_x = proj_vec[0] / proj_vec[2];
+//         let theta_y = proj_vec[1] / proj_vec[2];
+
+//         let position = det.observer_position.clone();
+//         let local_obs_position = mat * position;
+//         local_obs_positions.push(local_obs_position);
+
+//         local_thetas.push([theta_x, theta_y]);
+//         local_thetas_hash.insert(local_intid as u64, [theta_x, theta_y]);
+//         //println!("here inside {:10} {:10.4} {:10.4} {:12.9} {:12.9} {:10.6} {}", local_intid, theta_x*206265., theta_y*206265., longitude, latitude, det.epoch, detID);
+//     }
+
+//     //    println!("");
+//     let mut local_tree: KdTree<f64, 2> = KdTree::with_capacity(10);
+//     local_tree.extend(
+//         local_thetas
+//             .iter()
+//             .map(|&p| p)
+//             .zip(local_intids.iter().map(|&i| i as u64)),
+//     );
+
+//     //println!("large cluster: {:?}", local_intids.len());
+//     return Some(Cluster {
+//         //intid: central_intid,
+//         ref_epoch: central_detection_epoch,
+//         local_intids: local_intids,
+//         ref_point: point,
+//         local_points: local_points,
+//         local_thetas: local_thetas,
+//         local_thetas_hash: local_thetas_hash,
+//         local_tree: local_tree,
+//         local_obs_positions: local_obs_positions,
+//         unique_cluster_times: unique_cluster_times,
+//     })
+// }
+
+// // Function to convert a unit vector (x, y, z) to (lon, lat) in radians
+// fn unit_vector_to_lonlat(x: f64, y: f64, z: f64) -> (f64, f64) {
+//     let lon = y.atan2(x); // atan2(y, x) for longitude
+//     let lat = z.asin();    // asin(z) for latitude
+//     (lon, lat)
+// }
+
+// fn lonlat_to_unit_vector(lon: f64, lat: f64) -> (f64, f64, f64) {
+//     let x = lat.cos() * lon.cos();
+//     let y = lat.cos() * lon.sin();
+//     let z = lat.sin();
+//     (x, y, z)
+// }
+
+// fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+//     let depth = 13_u8;
+//     let nside = nside(depth) as u64;
+//     let npix = 12 * nside * nside;
+//     println!("Nside at depth {}: {} {}", depth, nside, (4.0*PI/(npix as f64)).sqrt()*(180.0/PI)*60.0*60.0);
+//     let nested: &Layer = get(depth);
+//     //let res = nested.hash(10.0_f64.to_radians(), 10.0_f64.to_radians());
+//     //println!("HEALPix index at depth 12 for lon=10°, lat=10°: {}", res);
+
+//     // Example unit vector (on the equator at lon ~45 deg)
+//     //let x = 0.0;
+//     //let y = 1.0;
+//     //let z = 0.0;
+
+//     //let (lon, lat) = unit_vector_to_lonlat(x, y, z);
+//     //let healpix_hash = nested.hash(lon, lat);
+//     //println!("Unit vector: ({}, {}, {})", x, y, z);
+//     //println!("Spherical coordinates (rad): lon={}, lat={}", lon, lat);
+//     //println!("HEALPix hash (depth {}): {}", depth, healpix_hash);
+
+//     //let obscode = "F51";
+//     let obscode = "X05";
+//     let spice_root = "/Users/mholman/Dropbox/support/kernels";
+
+//     // load spice kernels
+//     let mut kernel = SpiceKernel::new();
+//     kernel.load_spk(format!("{}/sb441-n16.bsp", spice_root).as_str())?;
+//     kernel.load_spk(format!("{}/de440s.bsp", spice_root).as_str())?;
+//     kernel.load_bpc(format!("{}/earth_1962_240827_2124_combined.bpc", spice_root).as_str())?;
+
+//     let mut detections: Vec<Detection> = Vec::new();
+//     let mut observatory = Observatory::from_obscode(obscode)?;
+
+//     let ssb = Origin::ssb();
+//     let mu = ssb.mu();
+//     //println!("Solar System Barycenter mu: {}", mu);
+    
+//     // read in the detections from a file
+//     //let file_path = "/Users/mholman/Dropbox/link/data/ps1-catalog-culled.csv";
+//     //let file_path = "/Users/mholman/Dropbox/link/data/P9-catalog.csv";
+//     //let file_path = "/Users/mholman/Dropbox/link/data/test_20260109_340_v2.csv";    
+//     let file_path = "/Users/mholman/Dropbox/link/data/test_20260109_230_v2.csv";    
+//     //let file_path = "/Users/mholman/Dropbox/link/data/rubin_20260109_test.csv";
+//     //let file_path = "/Users/mholman/Dropbox/link/data/test.csv";
+//     //let file_path = "/Users/mholman/Dropbox/link/data/cleaned_catalog.csv";
+//     let mut rdr = csv::Reader::from_path(file_path)?;
+
+//         // Read each row
+//     let mut count = 0;
+//     println!("Reading detections from {}", file_path);
+//     for result in rdr.records() {
+        
+//         let record = result?;
+//         let detID: String = record[2].parse()?;
+//         let ra: f64 = record[3].parse()?;
+//         let dec: f64 = record[4].parse()?;
+//         let obliq = 84381.448/3600.0;
+//         let (lon, lat) = equatorial_to_ecliptic(ra * std::f64::consts::PI / 180.0, dec * std::f64::consts::PI / 180.0, obliq * std::f64::consts::PI / 180.0);
+//         let astrom_sig: f64 = record[5].parse()?;
+//         let filt: String = record[6].parse()?;
+//         let mag : f64 = record[7].parse()?;
+//         let flux: f64 = record[8].parse()?;
+//         let dflux: f64 = record[9].parse()?;
+//         let mag_sig: f64 = dflux / flux;
+//         let epoch: f64 = record[14].parse()?;
+//         //let intid: i32 = record[14].parse()?;
+//         let intid: i32 = count;
+//         count += 1;
+//         let o = observatory.at(&Time::new(epoch, "utc", "jd")?, "ECLIPJ2000", "ssb", &kernel)?;
+//         let observer_position = o.position;
+//         let observer_velocity = o.velocity.unwrap();
+//         let exposure_id: i32 = 0;
+
+//         let det = Detection::new(
+//             intid,
+//             lon,
+//             lat,
+//             astrom_sig * (1. / 3600.) * std::f64::consts::PI / 180.0,
+//             Time::new(epoch, "utc", "jd")?,
+//             observer_position,
+//             observer_velocity,
+//             detID,
+//             filt,
+//             mag,
+//             mag_sig,
+//             exposure_id,
+//         );
+//         detections.push(det);
+//     }
+
+//         // Read the initial conditions from a file
+//     //let ic_file_path = "/Users/mholman/Dropbox/link/data/ics_r_80_4month_10arcsec.csv";
+//     //let ic_file_path = "/Users/mholman/Dropbox/link/data/CCs-garbage_-5arcsec.csv";
+//     let ic_file_path = "/Users/mholman/Dropbox/link/data/ics_r_35_4month_30arcsec.csv";
+//     //let ic_file_path = "/Users/mholman/Dropbox/link/data/ics_test.csv";
+//     let mut ic_rdr = csv::Reader::from_path(ic_file_path)?;
+
+//     let mut initial_conditions: Vec<InitialCondition> = Vec::new();
+//     let mut count = 0;
+
+//     //let epoch = 2456569.5;
+//     let epoch = 2460890.5; // 2025-Aug-05, for Rubin testing
+
+//     println!("Reading initial conditions from {}", ic_file_path);
+    
+
+//     for (j, result) in ic_rdr.records().enumerate() {
+//         let record = result?;
+//         let r: f64 = record[0].parse()?;
+//         let vr: f64 = record[1].parse()?;
+//         let vo: f64 = record[2].parse()?;
+//         let inc: f64 = record[3].parse()?;
+//         let kappa_f64: f64 = record[4].parse()?;
+
+//         let kappa = kappa_f64 as i32;
+
+//         let orbID = format!("ic_{:06}", j);
+//         let ep = Time::new(epoch, "tdb", "jd")?;
+//         /*
+//         println!(
+//             "Processing initial condition {}: r={} vr={} vo={} inc={} kappa={}",
+//             orbID, r, vr, vo, inc, kappa
+//         );
+//         */
+
+//         let mu = ssb.mu();
+
+//         let ic =
+//             InitialCondition::from_spherical(orbID, r, vr, vo, inc, kappa, ep, mu);
+
+//         initial_conditions.push(ic?);
+//         count += 1;
+//         //println!("Processed initial condition {}: {}", count, initial_conditions.len());
+//     }
+
+//     let mut points: Vec<[f64; 3]> = Vec::new();
+//     // open a file to write the clusters to
+//     let mut cluster_file = std::fs::File::create("clusters.txt")?;
+//     // write the header
+
+//     // Calculate cluster angles.
+//     let cluster_r2 = 2.0 * (1.0 - EPS.cos());
+//     let cluster_small_r2 = 2.0 * (1.0 - EPS_SMALL.cos());
+
+//     let obliq = 84381.448/3600.0;
+//     //let obliq = 84381.412/3600.0;
+
+ 
+//     let start_time = Instant::now();
+//     let n_ics = initial_conditions.len();
+
+//     //let mut cluster_bloom = Bloom::new_for_fp_rate(10_000_000, 0.00001)?;
+//     let mut cluster_set: HashSet<Vec<u64>> = HashSet::new();
+
+//     let mut n_clusters = 0;
+//     let mut ii = 0;
+//     //for ic in &initial_conditions[..n_ics] {
+//     // multi-thread over initial_conditions
+//     initial_conditions[..n_ics].par_iter().enumerate().for_each(|(ii, ic)| {
+
+//         let mut sg = SortedGroups::new();
+
+//         //let mut tracklet_hash = HashMap::new();
+
+//         //println!("Processing IC {} of {}: {}", ii + 1, n_ics, ic.id);
+//         //ii += 1;
+
+
+//         //if ii < 11889 {
+//             //continue;
+//         //}
+
+//         // thread 'main' panicked at /Users/mholman/.cargo/git/checkouts/cds-healpix-rust-86b7cfde0ff40f01/c0a0f8b/src/lib.rs:1314:3:
+//         // assertion failed: (-FRAC_PI_2..=FRAC_PI_2).contains(&lat)
+//         // note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+//         let mut points: Vec<[f64; 3]> = Vec::with_capacity(detections.len());
+//         let mut intids: Vec<i32> = Vec::with_capacity(detections.len());
+//         let mut det_ids: Vec<String> = Vec::with_capacity(detections.len());
+//         // let mut examined_hash = HashSet::new();
+
+//         let mut hp_map: HashMap<u64, Vec<i32>> = HashMap::new();
+
+//         // Transform all detections to points on the unit sphere according to the current orbit.
+//         let mut light_corrected_epochs: Vec<f64> = Vec::with_capacity(detections.len());
+//         for detection in &detections[..] {
+//             if let Some((pointing, light_corrected_epoch)) = sync_detection_to_orbit_with_time(&detection, &ic) {
+//                 let (lon, lat) = unit_vector_to_lonlat(pointing[0], pointing[1], pointing[2]);
+                
+//                 let idx = nested.hash(lon, lat);
+
+//                 hp_map.entry(idx as u64).or_insert_with(Vec::new).push(detection.intid);
+
+//                 points.push(pointing);
+//                 intids.push(detection.intid);
+//                 light_corrected_epochs.push(light_corrected_epoch);
+//                 det_ids.push(detection.detID.clone());
+//                 // println!("Transformed detection {} to point ({:.6}, {:.6}, {:.6}) at epoch {:.6}", detection.intid, pointing[0], pointing[1], pointing[2], light_corrected_epoch);
+//             }
+//         }
+//         // continue;
+
+//         // Iterate over the HashMap
+//         // Create a new HashMap to store counts of points per cell
+//         let mut cell_count_map: HashMap<usize, Vec<u64>> = HashMap::new();
+//         let mut total_points = 0;
+//         for (key, values) in &hp_map {
+//             let count = values.len();
+//             total_points += count;
+//             cell_count_map.entry(count).or_insert_with(Vec::new).push(*key);
+//         }
+//         //println!("Total transformed points: {}", total_points);
+//         let mut sorted_keys: Vec<&usize> = cell_count_map.keys().collect();
+//         sorted_keys.sort_by(|a, b| b.cmp(a));
+
+//         let mut ordered_cells = Vec::new();
+//         for key in sorted_keys {
+//             let count_vec = cell_count_map.get(key).unwrap();
+//             ordered_cells.extend(count_vec);
+
+//             /*
+//             if count_vec.len() < 10 {
+//                 println!("Size {} cells: {:?}", key, count_vec);
+//                 for cell in count_vec {
+//                     let dets_in_cell = hp_map.get(cell).unwrap();
+//                     println!("  Cell {}: detections {:?}", cell, dets_in_cell);
+//                 }
+//             }else {
+//                 println!("Size {} cells: count {}", key, count_vec.len());
+//             }
+//             */
+
+//         }
+
+//         //println!("Number of cells: {}", hp_map.len());
+//         let mut tree = KdTree::new();
+
+//         let mut intid_idx_hash: HashMap<u64, usize> = HashMap::new();
+//         for (i, intid) in intids.iter().enumerate() {
+//             intid_idx_hash.insert(*intid as u64, i);
+//         }
+//         tree.extend(
+//             points
+//                 .iter()
+//                 .map(|&p| p)
+//                 .zip(intids.iter().map(|&i| i as u64)),
+//         );
+
+//         //println!("Built tree with {} points", points.len());
+
+//         // For each point that has been successfully transformed, find its neighboring points.
+
+//         let mut tracklet_id = 0;
+
+//         for cell in ordered_cells.iter() {
+//             let cell_intids = &hp_map[cell];
+//             if cell_intids.len() < MIN_POINTS_PER_CELL {
+//                 //continue;
+//                 break;
+//             }
+//             //println!("Processing cell {} with {} points", cell, cell_intids.len());
+//             let (lon, lat) = nested.center(*cell);
+//             let (cell_x, cell_y, cell_z) = lonlat_to_unit_vector(lon, lat);
+//             let cell_point = [cell_x, cell_y, cell_z];
+//             let cluster = tree.within::<SquaredEuclidean>(&cell_point, cluster_r2);
+//             //println!("Found {} points in cluster around cell center", cluster.len());
+//             let clust = cull_cluster(&detections, &intid_idx_hash, &points, cell_point, &cluster, ic.epoch);
+//             if clust.is_none() {
+//                 //println!("Cluster cull returned None for cell {}", cell);
+//                 continue;
+//             }
+//             let clust = clust.unwrap();
+
+//             let astrom_sig: Vec<f64> = clust.local_intids
+//                 .iter()
+//                 .map(|id| detections[*id as usize].astrom_sig.clone())
+//                 .collect();
+
+//             let theta_x : Vec<f64> = clust.local_thetas
+//                 .iter()
+//                 .map(|xy| xy[0])
+//                 .collect();
+//             let theta_y : Vec<f64> = clust.local_thetas
+//                 .iter()
+//                 .map(|xy| xy[1])
+//                 .collect();
+//             let t: Vec<f64> = clust.local_intids
+//                 .iter()
+//                 .map(|id| detections[*id as usize].epoch - ic.epoch)
+//                 .collect();
+//             let mxe : Vec<f64> = clust.local_obs_positions
+//                 .iter()
+//                 .map(|pos| -pos[0])
+//                 .collect();
+//             let mye : Vec<f64> = clust.local_obs_positions
+//                 .iter()
+//                 .map(|pos| -pos[1])
+//                  .collect();
+
+//             //println!("Fitting cluster with {} points", t.len());
+//             // Fit model
+            
+//             //let fit : FitResult = coupled_weighted_fit(&t, &mxe, &mye, &theta_x, &theta_y, &astrom_sig, &astrom_sig);
+//             //println!("Fitted coupled model: \n{:?} {}", fit.params, fit.chi2);
+            
+//             let fraction = 0.15;
+
+//             /*
+//             let fit_result = iterative_fraction_reject(
+//                 &t, &mxe, &mye, &theta_x, &theta_y, &astrom_sig, &astrom_sig,
+//                 3.0, fraction, MIN_POINTS_PER_CELL,
+//             );
+//             */
+
+            
+//             let fit_result = iterative_reject(
+//                 &t, &mxe, &mye, &theta_x, &theta_y, &astrom_sig, &astrom_sig,
+//                 5.0,   // 3σ threshold
+//                 MIN_POINTS_PER_CELL     // stop if fewer than 10 points remain
+//             );
+            
+
+//             let fit_final = match fit_result {
+//                 Ok(fit_final) => fit_final,
+//                 Err(e) => {
+//                     //println!("Fit failed: {}", e);
+//                     continue;
+//                 }
+//             };
+
+//             let (fit, kept_indices, rejected_indices) = fit_final;
+
+//             let params = fit.params;
+//             println!("# IC {} of {}: {}", ii + 1, n_ics, ic.id);
+//             println!("# Fit successful for cell {}: {:?}", cell, params);
+            
+//             //println!("Rejected points indices: {:?}", rejected_indices);
+//             let rejected_intids: Vec<usize> = rejected_indices
+//                 .iter()
+//                 .map(|&idx| clust.local_intids[idx] as usize)
+//                 .collect();
+//             /*
+//             for idx in &rejected_indices {
+//                 println!("  Rejected intid: {}", clust.local_intids[*idx]);
+//             }
+//             */
+//             //println!("Kept points indices: {:?}", kept_indices);
+//             println!("# intid     detID         t(days)     theta_x(\")  theta_y(\")  x_model(\")  y_model(\")    sig_x     sig_y"); 
+//             for i in 0..t.len() {
+//                 if rejected_indices.contains(&i) {
+//                     continue;
+//                 }
+//                 let x_model = params[0] + params[1] * t[i] + params[2] * mxe[i];
+//                 let y_model = params[3] + params[4] * t[i] + params[2] * mye[i];
+//                 let rx = theta_x[i] - x_model;
+//                 let pull_x = rx / astrom_sig[i];
+//                 let ry = theta_y[i] - y_model;
+//                 let pull_y = ry / astrom_sig[i];
+//                 let pull = pull_x.abs().max(pull_y.abs());
+//                 let intid = clust.local_intids[i];
+//                 let detID = &detections[intid as usize].detID;
+//                 println!("{:8} {:12} {:12.6}   {:8.4}     {:8.4}    {:8.4}   {:8.4}.  {:8.4}.  {:8.4}", clust.local_intids[i], detID, t[i], theta_x[i]*206265., theta_y[i]*206265., x_model*206265., y_model*206265., pull_x, pull_y);
+//             }
+
+//             println!("# detID         epoch        RA(deg)   sig_x(\")   Dec(deg)  sig_y(\")  obs_x        obs_y           obs_z      obscode  mag");
+//             for i in 0..t.len() {
+//                 if rejected_indices.contains(&i) {
+//                     continue;
+//                 }
+//                 //let x_model = params[0] + params[1] * t[i] + params[2] * mxe[i];
+//                 //let y_model = params[3] + params[4] * t[i] + params[2] * mye[i];
+//                 //let rx = theta_x[i] - x_model;
+//                 //let pull_x = rx / astrom_sig[i];
+//                 //let ry = theta_y[i] - y_model;
+//                 //let pull_y = ry / astrom_sig[i];
+//                 //let pull = pull_x.abs().max(pull_y.abs());
+//                 let intid = clust.local_intids[i];
+//                 let detID = &detections[intid as usize].detID;
+//                 let filt = &detections[intid as usize].filt;
+//                 let rho_hat = detections[clust.local_intids[i] as usize].rho_hat; 
+//                 let lam = rho_hat[1].atan2(rho_hat[0]);
+//                 let beta = rho_hat[2].asin();
+//                 // These are ecliptic latitude and longitude at this point.
+//                 // Convert back to equatorial for output.
+//                 let (ra, dec) = ecliptic_to_equatorial(lam, beta, obliq * std::f64::consts::PI / 180.0);
+
+//                 let ra_deg = ra * 180.0 / PI;
+//                 let dec_deg: f64 = dec * 180.0 / PI;
+//                 let epoch = detections[clust.local_intids[i] as usize].epoch;
+//                 let obscode = obscode;
+//                 let mag = detections[clust.local_intids[i] as usize].mag;
+//                 let mag_sig = detections[clust.local_intids[i] as usize].mag_sig;
+//                 let obs_pos = &detections[clust.local_intids[i] as usize].observer_position;
+//                 let obs_pos2 = ecliptic_to_equatorial_vector(*obs_pos, obliq * std::f64::consts::PI / 180.0);
+//                 //println!("obs pos ecl: {:13.10}  {:13.10}  {:13.10}", obs_pos2[0], obs_pos2[1], obs_pos2[2]);
+
+
+//                 //let o = observatory.at(&Time::new(epoch, "tdb", "jd")?, "J2000", "ssb", &kernel)?;
+//                 //let obs_pos2 = o.position;
+//                 //let observer_velocity = o.velocity.unwrap();
+//                 println!("{:12} {:12} {:12.6} {:9.5}   {:5.2}   {:9.5}   {:5.2}  {:13.10}  {:13.10}  {:13.10}   {}   {:.2} {:.2} {}", 
+//                     ic.id, detID, epoch, ra_deg, astrom_sig[i]*206265., dec_deg, astrom_sig[i]*206265., obs_pos2[0], obs_pos2[1], obs_pos2[2], obscode, mag, mag_sig, filt);
+//             }
+             
+  
+//         }
+//     });
+            
+//     //};
+
+//     let duration = start_time.elapsed();
+//     println!("Time elapsed: {:?}", duration);
+
+//     Ok(())
+// }
+
+
+// // Thinking about a generic tracklet manager like pytrax
+// //
+// // One of the goals is to be able to efficiently identify which
+// // tracklets are proper subsets of other tracklets.
+// //
+// // We can think of tracklets as sorted collections of integers, with
+// // each integer referring to a specific detection.  The sorting is 
+// // primarily to get each tracklet a unique identifier (key), but it
+// // could also refer to a time ordering.
+// //
+// // We can maintain a dictionary that has the detection integers as
+// // keys and the collection of tracklets that contain that detection 
+// // as values.
+// //
+// // To determine is a tracklet is a proper subset of some other tracklet,
+// // we can aggregrate all the tracklets it overlaps by iterating over the
+// // detections in the tracket, looking up the tracklets each detection is
+// // a member of, merging the set of tracklets to remove duplicates, and
+// // then checking one-by-one if the main tracklets is a proper subset of
+// // any in the merged group.  This should be a lot faster because there are
+// // fewer tracklets to check (compared to the universe of all tracklets).
+// // Also, the checks can be terminated as soon as a proper superset is found.
+
+
+fn main() {
+    println!("Hello, world!");
+}

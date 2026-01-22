@@ -1,0 +1,31 @@
+[package]
+name = "pointdexter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+spacerocks = { path = "/Users/kjnapier/spacerocks" }
+polars = { version = "0.50.0", features = ["lazy"] }
+nalgebra = { version = "0.32.2" }
+
+kiddo = { git = "https://github.com/sdd/kiddo" }
+clap = { version = "*", features = ["derive"] }
+serde_yaml = "*"
+serde = { version = "*", features = ["derive"] }
+image = "0.25"
+
+
+ndarray = "0.15"
+ndarray-linalg = "0.16"
+ordered-float = "4"
+cdshealpix = { git = "https://github.com/cds-astro/cds-healpix-rust.git" }
+rayon = "*"
+
+
+# csv = "*"
+# rayon = "*"
+
+# kiddo = { git = "https://github.com/sdd/kiddo" }
+# serde = { version = "*", features = ["derive"] }
+

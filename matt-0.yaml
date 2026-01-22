@@ -1,0 +1,18 @@
+epsilon_arcsec: 30.0
+min_detections: 6
+min_nites: 3
+max_detections: 100
+min_duration: 14.0
+
+spice_path: "/Users/kjnapier/data/spice"
+
+detection_catalog: "/Users/kjnapier/pointdexter/data/fakes.csv"
+
+initial_conditions_file: "/Users/kjnapier/pointdexter/data/ics_r>35_4month_30arcsec.csv"
+orbit_reference_plane: "ECLIPTIC"
+ic_origin: "SSB"
+reference_epoch: 2457344.4177751234
+ic_type: "spherical"
+
+output_path: "/path/to/output"
+clusters_filename: "clusters.csv"
