@@ -2,53 +2,56 @@ use nalgebra::Vector3;
 use crate::detection::Detection;
 use crate::initial_condition::InitialCondition;
 
+
 use spacerocks::data::{SPEED_OF_LIGHT};
 
-// --- Orbit Sync ---
-#[inline(never)]
-fn cost_and_gradient(det: &Detection, ic: &InitialCondition, rho: f64) -> (f64, f64, f64) {
-    let ltt = rho / SPEED_OF_LIGHT;
-    let ep = det.epoch - ltt;
-    let r = ic.r_at_epoch(ep);
 
-    let cost = r * r
-        - rho * rho
-        - 2.0 * rho * det.rho_hat_dot_observer_position
-        - det.observer_distance_squared;
-    let grad = -2.0 * (rho + det.rho_hat_dot_observer_position);
+pub fn optimize_rho_v2(det: &Detection, ic: &InitialCondition, mut rho0: f64, sgn: f64) -> Option<(f64, f64)> {
+    let tol = 1e-6;         
+    let max_iter = 100;
+    let inv_c = 1.0 / SPEED_OF_LIGHT;
 
-    (cost, grad, r)
-}
+    let dot = det.rho_hat_dot_observer_position;
+    let dot2 = dot * dot;
+    let obs2 = det.observer_distance_squared;
 
-#[inline(never)]
-fn optimize_rho(det: &Detection, ic: &InitialCondition, rho0: f64) -> (f64, f64) {
-    // tunable parameter
-    let tol = 1e-8;
-    let mut rho = rho0;
-    let (mut cost, mut grad, mut r) = cost_and_gradient(det, ic, rho);
-    while cost.abs() > tol {
-        if grad == 0.0 {
-            break;
+    for _ in 0..max_iter {
+        let dt = rho0 * inv_c;
+        let r = ic.r_at_epoch(det.epoch - dt);
+
+        // disc = r*r + dot2 - obs2
+        // mul_add can be a wash, but often maps nicely to FMA where available
+        let disc = r.mul_add(r, dot2 - obs2);
+        if disc < 0.0 { return None; }
+
+        let rho = -dot + sgn * disc.sqrt();
+
+        let d = rho - rho0;
+        if d.abs() < tol {
+            return Some((rho, r));
         }
-        rho -= cost / grad;
-        let (c, g, new_r) = cost_and_gradient(det, ic, rho);
-        cost = c;
-        grad = g;
-        r = new_r;
+        rho0 = rho;
     }
-    (rho, r)
+    None
 }
+
+
+
 
 #[inline(never)]
 pub fn sync_detection_to_orbit(det: &Detection, ic: &InitialCondition) -> Option<[f64; 3]> {
-    let (rho, r) = optimize_rho(det, ic, ic.r - 1.0);
-
+    // let (rho, r) = optimize_rho(det, ic, ic.r - 1.0);
+    let rho_opt = optimize_rho_v2(det, ic, ic.r - 1.0, 1.0); // Keep in mind that there can be multiple solutions, but not for TNOs.
+    let (rho, r) = match rho_opt {
+        Some((rho_val, r_val)) => (rho_val, r_val),
+        None => return None,
+    };
+    
     let r_vec = det.observer_position + rho * det.rho_hat;
+    
 
     let light_corrected_epoch = det.epoch - rho / SPEED_OF_LIGHT;
-    if ((r_vec[2].abs() / r).asin()).abs() > ic.inc {
-        return None;
-    }
+    let (f, g) = ic.fg_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
 
     let (x, y, z) = (r_vec[0], r_vec[1], r_vec[2]);
     let xy_norm = (x * x + y * y).sqrt();
@@ -59,51 +62,21 @@ pub fn sync_detection_to_orbit(det: &Detection, ic: &InitialCondition) -> Option
     let cos_theta = xy_norm / r;
 
     let vo = ic.h / r;
-    let vr = ic.vr_at_epoch(light_corrected_epoch);
-    let cos_psi = ic.inc.cos() / cos_theta;
+    let vsq = (ic.energy + ic.mu / r).max(0.0) * 2.0; // ensure non-negative vsq
+    let vr = (vsq - vo * vo).max(0.0).sqrt(); // ensure non-negative argument for sqrt
+    
+    if (r_vec[2] / r).abs() > ic.sin_latitude_threshold {
+        return None;
+    }
+
+    let cos_psi = ic.cos_inc / cos_theta;
     let sin_psi = ic.kappa as f64 * (1.0 - cos_psi * cos_psi).sqrt();
 
     let v_vec = vr * r_vec / r + vo * (cos_psi * ahat + sin_psi * dhat);
 
-    let f = ic.f_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
-    let g = ic.g_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
+    
     let new_position = r_vec * f + v_vec * g;
 
     let new_pointing = new_position / ic.r;
     Some([new_pointing[0], new_pointing[1], new_pointing[2]])
-}
-
-
-pub fn sync_detection_to_orbit_with_time(det: &Detection, ic: &InitialCondition) -> Option<([f64; 3], f64)> {
-    let (rho, r) = optimize_rho(det, ic, ic.r - 1.0); // Keep in mind that there can be multiple solutions, but not for TNOs.
-
-    let r_vec = det.observer_position + rho * det.rho_hat;
-
-    let light_corrected_epoch = det.epoch - rho / SPEED_OF_LIGHT;
-        
-    if (r_vec[2] / r).abs() > ic.inc.sin().abs() {
-        return None;
-    }
-
-    let (x, y, z) = (r_vec[0], r_vec[1], r_vec[2]);
-    let xy_norm = (x * x + y * y).sqrt();
-
-    let ahat = Vector3::new(-y / xy_norm, x / xy_norm, 0.0);
-    let dhat = Vector3::new(-z * x / (r * xy_norm), -z * y / (r * xy_norm), xy_norm / r);
-
-    let cos_theta = xy_norm / r;
-    
-    let vo = ic.h / r;
-    let vr = ic.vr_at_epoch(light_corrected_epoch);
-    let cos_psi = ic.inc.cos() / cos_theta;
-    let sin_psi = ic.kappa as f64 * (1.0 - cos_psi * cos_psi).sqrt();
-    
-    let v_vec = vr * r_vec / r + vo * (cos_psi * ahat + sin_psi * dhat);
-    
-    let f = ic.f_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
-    let g = ic.g_at_epoch(ic.epoch + (ic.epoch - light_corrected_epoch));
-    let new_position = r_vec * f + v_vec * g;
-
-    let new_pointing = new_position / ic.r;
-    Some(([new_pointing[0], new_pointing[1], new_pointing[2]], light_corrected_epoch))
 }

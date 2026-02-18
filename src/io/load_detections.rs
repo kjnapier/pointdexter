@@ -140,9 +140,12 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
     // ---------- optional metadata ----------
     let ast_ucty = opt_f64(&df, "ast_ucty")?;
     let magnitude = opt_f64(&df, "mag")?;
+    let mag_ucty = opt_f64(&df, "mag_ucty")?;
     let filter = opt_string_like(&df, "filter")?;
     let detid = opt_string_like(&df, "detid")?;
     let trackid = opt_string_like(&df, "trackid")?;
+    let objid = opt_string_like(&df, "objid")?;
+    let obscode = opt_string_like(&df, "obscode")?;
 
     // ---------- build ----------
     let mut out = Vec::with_capacity(n);
@@ -224,6 +227,18 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
         }
         if let Some(col) = &trackid {
             det.trackid = col.get(i);
+        }
+
+        if let Some(col) = &mag_ucty {
+            det.mag_ucty = col.get(i);
+        }
+
+        if let Some(col) = &objid {
+            det.objid = col.get(i);
+        }
+
+        if let Some(col) = &obscode {
+            det.obscode = col.get(i);
         }
 
         if reference_plane.to_lowercase() == "ecliptic" {

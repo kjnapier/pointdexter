@@ -34,7 +34,7 @@ pub fn fit_chebyshev_direct(xs: &[f64], ys: &[f64], degree: usize) -> Vec<f64> {
 }
 
 
-#[inline(never)]
+// #[inline(never)]
 pub fn chebyshev_eval(c: &[f64], x: f64) -> f64 {
     if c.is_empty() {
         return 0.0;
@@ -53,3 +53,32 @@ pub fn chebyshev_eval(c: &[f64], x: f64) -> f64 {
     }
     sum
 }
+
+// #[inline(always)]
+// pub fn chebyshev_eval(c: &[f64], x: f64) -> f64 {
+//     let n = c.len();
+//     if n == 0 {
+//         return 0.0;
+//     }
+//     if n == 1 {
+//         return c[0];
+//     }
+
+//     let two_x = 2.0 * x;
+
+//     // Clenshaw recurrence:
+//     // b_{k} = 2x b_{k+1} - b_{k+2} + c_k
+//     // p(x) = b_0 - x b_1
+//     let mut b_k1 = 0.0; // b_{k+1}
+//     let mut b_k2 = 0.0; // b_{k+2}
+
+//     for &ck in c[1..].iter().rev() {
+//         let b_k = two_x.mul_add(b_k1, ck) - b_k2;
+//         b_k2 = b_k1;
+//         b_k1 = b_k;
+//     }
+
+//     // incorporate c0 and finalize
+//     let b0 = two_x.mul_add(b_k1, c[0]) - b_k2;
+//     b0 - x * b_k1
+// }

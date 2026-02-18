@@ -2,3 +2,8 @@
 /data
 /notebooks
 Cargo.lock
+*.txt
+*.svg
+*.csv
+/figures
+.DS_Store

@@ -9,23 +9,34 @@ spacerocks = { path = "/Users/kjnapier/spacerocks" }
 polars = { version = "0.50.0", features = ["lazy"] }
 nalgebra = { version = "0.32.2" }
 
-kiddo = { git = "https://github.com/sdd/kiddo" }
+# kiddo = { git = "https://github.com/sdd/kiddo" }
+kiddo = { version = "5.2.4" }
+
 clap = { version = "*", features = ["derive"] }
 serde_yaml = "*"
 serde = { version = "*", features = ["derive"] }
 image = "0.25"
+itertools = "*"
 
-
-ndarray = "0.15"
-ndarray-linalg = "0.16"
-ordered-float = "4"
-cdshealpix = { git = "https://github.com/cds-astro/cds-healpix-rust.git" }
 rayon = "*"
 
+# anyhow = "*"
+cdshealpix = { git = "https://github.com/cds-astro/cds-healpix-rust.git" }
+plotly = { version = "*" , features = ["kaleido"] }  
+# argmin = { version = "*"}
+# argmin-math = { version = "*" }
+# argmin-observer-slog = { version = "*" }
+# ndarray = "0.15"
+# ndarray-linalg = "0.16"
+ordered-float = "4"
+indicatif = { version = "0.17", features = ["rayon"] }
 
-# csv = "*"
-# rayon = "*"
 
-# kiddo = { git = "https://github.com/sdd/kiddo" }
-# serde = { version = "*", features = ["derive"] }
-
+[profile.release]
+# lto = "fat"          # link time optimization
+# codegen-units = 1    # more stable profiles (optional)
+panic = "abort"      # optional
+strip = true         # Strip symbols from the binary (reduces size) [4]
+debug = false        # Ensure debug info is off
+# [profile.release.package."*"]
+# debug = true

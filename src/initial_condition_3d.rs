@@ -10,13 +10,11 @@ fn nice_acos(x: f64) -> f64 {
 
 // --- InitialCondition ---
 #[derive(Debug, Clone)]
-pub struct InitialCondition {
+pub struct InitialCondition3D {
     pub id: String,
     pub r: f64,
     pub vr: f64,
     pub vo: f64,
-    pub inc: f64,
-    pub kappa: i32,
     pub epoch: f64,
     pub mu: f64,
     pub h: f64,
@@ -26,22 +24,15 @@ pub struct InitialCondition {
     pub vr_poly: Vec<f64>,
     pub f_poly: Vec<f64>,
     pub g_poly: Vec<f64>,
-    // pub stumpff_c_poly: Vec<f64>,
-    // pub stumpff_s_poly: Vec<f64>,
-    // pub universal_anomaly_poly: Vec<f64>,
-    pub cos_inc: f64,
-    pub sin_latitude_threshold: f64,
     pub energy: f64,
 }
 
-impl InitialCondition {
+impl InitialCondition3D {
     pub fn from_elements(
         id: String,
         q: f64,
         e: f64,
-        inc: f64,
         true_anomaly: f64,
-        kappa: i32,
         epoch: Time,
         mu: f64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -57,16 +48,14 @@ impl InitialCondition {
         let vo = h / r0;
         let vr = (mu / h) * e * true_anomaly.sin();
 
-        Self::from_spherical(id, r0, vr, vo, inc, kappa, epoch, mu)
+        Self::from_spherical(id, r0, vr, vo, epoch, mu)
     }
 
     pub fn from_keplerian(
         id: String,
         q: f64,
         e: f64,
-        inc: f64,
         mean_anomaly: f64,
-        kappa: i32,
         epoch: Time,
         mu: f64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -80,7 +69,7 @@ impl InitialCondition {
         let vo = h / r0;
         let vr = (mu / h) * e * true_anomaly.sin();
 
-        Self::from_spherical(id, r0, vr, vo, inc, kappa, epoch, mu)
+        Self::from_spherical(id, r0, vr, vo, epoch, mu)
     }
 
     pub fn from_spherical(
@@ -88,8 +77,6 @@ impl InitialCondition {
         r: f64,
         vr: f64,
         vo: f64,
-        inc: f64,
-        kappa: i32,
         epoch: Time,
         mu: f64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -161,10 +148,6 @@ impl InitialCondition {
             .map(|((&s, &rval), &c)| 1.0 - s * s / rval * c)
             .collect();
 
-        // let z = alpha * chi.powi(2);
-        // let gauss_fdot = (chi * mu.sqrt() / (r_new.norm() * r)) * (z * stumpff_s(z) - 1.0);
-        // let gauss_gdot = 1.0 - (chi.powi(2) / r_new.norm()) * stumpff_c(z);
-
         let r_vr_values: Vec<f64> = f_values
             .iter()
             .zip(fdot_values.iter())
@@ -200,23 +183,13 @@ impl InitialCondition {
         let vr_poly = fit_chebyshev_direct(&scaled_dt_values, &vr_values, 3);
         let f_poly = fit_chebyshev_direct(&scaled_dt_values, &f_values, 3);
         let g_poly = fit_chebyshev_direct(&scaled_dt_values, &g_values, 3);
-        let stumpff_c_poly = fit_chebyshev_direct(&scaled_dt_values, &stumpff_c_values, 3);
-        let stumpff_s_poly = fit_chebyshev_direct(&scaled_dt_values, &stumpff_s_values, 3);
-        let universal_anomaly_poly = fit_chebyshev_direct(&scaled_dt_values, &s_values, 3);
 
-        let mut latitude_threshold = inc;
-        if latitude_threshold > std::f64::consts::PI / 2.0 {
-            latitude_threshold = std::f64::consts::PI - latitude_threshold;
-        }
-        let sin_latitude_threshold = latitude_threshold.sin();
 
-        Ok(InitialCondition {
+        Ok(InitialCondition3D {
             id,
             r,
             vr,
             vo,
-            inc,
-            kappa,
             epoch: epoch_jd,
             mu,
             h,
@@ -226,11 +199,6 @@ impl InitialCondition {
             vr_poly,
             f_poly,
             g_poly,
-            // stumpff_c_poly,
-            // stumpff_s_poly,
-            // universal_anomaly_poly,
-            cos_inc: inc.cos(),
-            sin_latitude_threshold,
             energy,
         })
     }
@@ -242,53 +210,6 @@ impl InitialCondition {
         let scaled_dt = dt / self.interpolation_bounds;
         chebyshev_eval(&self.vr_poly, scaled_dt)
     }
-
-    // pub fn rfg_at_epoch(&self, epoch: f64) -> (f64, f64, f64) {
-    //     let dt = epoch - self.epoch;
-    //     let scaled_dt = dt / self.interpolation_bounds;
-    //     // let s = chebyshev_eval(&self.stumpff_s_poly, scaled_dt);
-    //     // let c = chebyshev_eval(&self.stumpff_c_poly, scaled_dt);
-    //     // let chi = chebyshev_eval(&self.universal_anomaly_poly, scaled_dt);
-    //     // let s = stumpff_s(self.alpha * chi * chi);
-    //     // let c = stumpff_c(self.alpha * chi * chi);
-    //     // let f = 1.0 - s * s / self.r * c;
-    //     // let g = dt - chi.powi(3) / self.mu.sqrt() * s;
-    //     let f = chebyshev_eval(&self.f_poly, scaled_dt);
-    //     let g = chebyshev_eval(&self.g_poly, scaled_dt);    
-    //     let r = chebyshev_eval(&self.r_poly, scaled_dt);
-    //     // let rsq = f.powi(2) * self.r.powi(2) + 2.0 * f * g * self.r * self.vr + g.powi(2) * (self.vo.powi(2) + self.vr.powi(2));
-    //     // let r = rsq.sqrt();
-    //     (r, f, g)
-    // }
-
-    // pub fn r_at_epoch(&self, epoch: f64) -> f64 {
-    //     let dt = epoch - self.epoch;
-    //     let scaled_dt = dt / self.interpolation_bounds;
-    //     // let s = chebyshev_eval(&self.stumpff_s_poly, scaled_dt);
-    //     // let c = chebyshev_eval(&self.stumpff_c_poly, scaled_dt);
-    //     let chi = chebyshev_eval(&self.universal_anomaly_poly, scaled_dt);
-    //     let s = stumpff_s(self.alpha * chi * chi);
-    //     let c = stumpff_c(self.alpha * chi * chi);
-    //     let f = 1.0 - s * s / self.r * c;
-    //     let g = dt - chi.powi(3) / self.mu.sqrt() * s;
-    //     let rsq = f.powi(2) * self.r.powi(2) + 2.0 * f * g * self.r * self.vr + g.powi(2) * (self.vo.powi(2) + self.vr.powi(2));
-    //     let r = rsq.sqrt();
-    //     r
-    // }
-
-    // pub fn fg_at_epoch(&self, epoch: f64) -> (f64, f64) {
-    //     let dt = epoch - self.epoch;
-    //     let scaled_dt = dt / self.interpolation_bounds;
-    //     // let s = chebyshev_eval(&self.stumpff_s_poly, scaled_dt);
-    //     // let c = chebyshev_eval(&self.stumpff_c_poly, scaled_dt);
-    //     // let chi = chebyshev_eval(&self.universal_anomaly_poly, scaled_dt);
-    //     let chi = chebyshev_eval(&self.universal_anomaly_poly, scaled_dt);
-    //     let s = stumpff_s(self.alpha * chi * chi);
-    //     let c = stumpff_c(self.alpha * chi * chi);
-    //     let f = 1.0 - s * s / self.r * c;
-    //     let g = dt - chi.powi(3) / self.mu.sqrt() * s;
-    //     (f, g)
-    // }
 
     // #[inline(never)]
     pub fn r_at_epoch(&self, epoch: f64) -> f64 {
@@ -312,8 +233,6 @@ impl InitialCondition {
         let g = chebyshev_eval(&self.g_poly, scaled_dt);
         (f, g)
     }
-
-    
 
     // #[inline(never)]
     pub fn f_at_epoch(&self, epoch: f64) -> f64 {

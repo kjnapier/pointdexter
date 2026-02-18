@@ -79,3 +79,29 @@
     //         }
     //     }
     // });
+
+
+
+
+    // let filtered_dts: Vec<f64> = dts.iter().cloned().filter(|&dt| dt <= max_dt).collect();
+            // if filtered_dts.len() < config.min_detections {
+            //     continue;
+            // }
+
+            // let mut kept_indices: Vec<usize> = indices.iter()
+            //     .zip(dts.iter())
+            //     .filter(|&(_i, &dt)| dt <= max_dt)
+            //     .map(|(&i, &_dt)| i)
+            //     .collect();
+
+
+
+
+
+             // let mut thresh = ic.inc;
+    // if ic.inc > std::f64::consts::PI / 2.0 {
+    //     thresh = std::f64::consts::PI - ic.inc;
+    // }
+    // if (r_vec[2] / r).asin().abs() > thresh {
+    //     return None;
+    // }

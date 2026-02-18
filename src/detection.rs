@@ -16,6 +16,16 @@ pub enum ReferencePlane {
     Equatorial,
 }
 
+// make the str for, so you can pass it to functions
+impl ReferencePlane {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ReferencePlane::Ecliptic => "ECLIPJ2000",
+            ReferencePlane::Equatorial => "J2000",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Detection {
 
@@ -29,8 +39,11 @@ pub struct Detection {
     pub observer_velocity: Option<Vector3<f64>>,
     
     pub mag: Option<f64>,
+    pub mag_ucty: Option<f64>,
     pub ast_ucty: Option<f64>,
     pub filter: Option<String>,
+    pub objid: Option<String>,
+    pub obscode: Option<String>,
     
     pub rho_hat_dot_observer_position: f64,
     pub observer_distance_squared: f64,
@@ -58,9 +71,12 @@ impl Detection {
             ast_ucty: None,
             observer_velocity: None,
             detid: None,
+            objid: None,
             trackid: None,
             mag: None,
+            mag_ucty: None,
             filter: None,
+            obscode: None,
             rho_hat_dot_observer_position: rho_hat_dot_observer_position,
             observer_distance_squared: observer_distance_squared,
         }

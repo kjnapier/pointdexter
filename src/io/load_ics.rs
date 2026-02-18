@@ -1,72 +1,6 @@
-// use polars::prelude::*;
-// use crate::initial_condition::InitialCondition;
-
-// use spacerocks::time::Time;
-// use spacerocks::coordinates::Origin;
-
-// pub fn load_initial_conditions(path: &str, method: &str, origin: &str, reference_epoch_jd: f64) -> Result<Vec<InitialCondition>, Box<dyn std::error::Error>> {
-
-//     let mut spacerock_origin = Origin::from_str(origin)?;
-//     let mu = spacerock_origin.mu();
-    
-//     let kind = method.to_lowercase();
-//     match kind.as_str() {
-//         "keplerian" => read_initial_conditions_kep(path, mu, reference_epoch_jd),
-//         "spherical" => read_initial_conditions_sph(path, mu, reference_epoch_jd),
-//         _ => Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid method for reading initial conditions. Use 'keplerian' or 'spherical'."))),
-//     }
-// }
-
-// pub fn read_initial_conditions_kep(path: &str, mu: f64, reference_epoch_jd: f64) -> Result<Vec<InitialCondition>, Box<dyn std::error::Error>> {
-
-//     let initial_conditions = CsvReadOptions::default()
-//         .with_has_header(true)
-//         .try_into_reader_with_file_path(Some(path.into()))?
-//         .finish()?;
-
-//     let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
-
-//     let mut ics: Vec<InitialCondition> = Vec::new();
-//     for idx in 0..initial_conditions.height() {
-//         // id is a string column
-//         let id = initial_conditions["id"].utf8()?.get(idx).unwrap();
-//         let q = initial_conditions["q"].f64()?.get(idx).unwrap();
-//         let e = initial_conditions["e"].f64()?.get(idx).unwrap();
-//         let inc = initial_conditions["inc"].f64()?.get(idx).unwrap();
-//         let M0 = initial_conditions["M0"].f64()?.get(idx).unwrap();
-//         let kappa = initial_conditions["kappa"].f64()?.get(idx).unwrap() as i32;
-//         let ic = InitialCondition::from_elements(id.to_string(), q, e, inc, M0, kappa, epoch.clone(), mu)?;
-//         ics.push(ic);
-//     }
-//     Ok(ics)
-// }
-
-
-// pub fn read_initial_conditions_sph(path: &str, mu: f64, reference_epoch_jd: f64) -> Result<Vec<InitialCondition>, Box<dyn std::error::Error>> {
-//     let initial_conditions = CsvReadOptions::default()
-//         .with_has_header(true)
-//         .try_into_reader_with_file_path(Some(path.into()))?
-//         .finish()?;
-
-//     let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
-
-//     let mut ics: Vec<InitialCondition> = Vec::new();
-//     for idx in 0..initial_conditions.height() {
-//         let id = initial_conditions["id"].utf8()?.get(idx).unwrap();
-//         let r = initial_conditions["r"].f64()?.get(idx).unwrap();
-//         let vr = initial_conditions["vr"].f64()?.get(idx).unwrap();
-//         let vo = initial_conditions["vo"].f64()?.get(idx).unwrap();
-//         let inc = initial_conditions["inc"].f64()?.get(idx).unwrap();
-//         let kappa = initial_conditions["kappa"].f64()?.get(idx).unwrap() as i32;
-//         let ic = InitialCondition::from_spherical(id.to_string(), r, vr, vo, inc, kappa, epoch.clone(), mu)?;
-//         ics.push(ic);
-// }
-//     Ok(ics)
-// }
-
-
 use polars::prelude::*;
 use crate::initial_condition::InitialCondition;
+use crate::initial_condition_3d::InitialCondition3D;
 
 use spacerocks::coordinates::Origin;
 use spacerocks::time::Time;
@@ -218,4 +152,38 @@ pub fn read_initial_conditions_sph(
         ics.push(ic);
     }
     Ok(ics)
+}
+
+pub fn read_initial_conditions_3d(path: &str, mu: f64, reference_epoch_jd: f64) -> Result<Vec<InitialCondition3D>, Box<dyn std::error::Error>> {
+    let df = read_csv(path)?;
+    let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
+
+    let r = df.column("r")?.as_series().unwrap().f64()?;
+    let vr = df.column("vr")?.as_series().unwrap().f64()?;
+    let vo = df.column("vo")?.as_series().unwrap().f64()?;
+
+    let mut ics = Vec::with_capacity(df.height());
+    for row in 0..df.height() {
+        let id = read_id(&df, row)?;
+
+        let ic = InitialCondition3D::from_spherical(
+            id,
+            r.get(row).ok_or_else(|| format!("Row {row}: 'r' is null"))?,
+            vr.get(row).ok_or_else(|| format!("Row {row}: 'vr' is null"))?,
+            vo.get(row).ok_or_else(|| format!("Row {row}: 'vo' is null"))?,
+            epoch.clone(),
+            mu,
+        )?;
+        ics.push(ic);
+    }
+    Ok(ics)
+}
+
+
+
+pub fn load_initial_conditions3d(path: &str, origin: &str, reference_epoch_jd: f64) -> Result<Vec<InitialCondition3D>, Box<dyn std::error::Error>> {
+    let spacerock_origin = Origin::from_str(origin)?;
+    let mu = spacerock_origin.mu();
+
+    read_initial_conditions_3d(path, mu, reference_epoch_jd)
 }
