@@ -23,8 +23,10 @@ Provide a CSV file containing the detections to be linked. The CSV file should h
 | `obs_vz`      | Observer Z velocity (Equatorial)    | au/day       | No            |
 | `ast_ucty`    | Astrometric uncertainty             | arcseconds   | No            |
 | `mag`         | Apparent magnitude of detection     | magnitudes   | No            |
+| `mag_ucty`    | Uncertainty in apparent magnitude   | magnitudes   | No            |
 | `filter`      | Photometric filter                  | string       | No            |
 | `detid`       | Detection ID                        | string       | No            |
+| `objid`       | Object ID (if known)                | string       | No            |
 | `trackid`     | Tracklet ID                         | string       | No            |
 
 #### Initial Conditions File
