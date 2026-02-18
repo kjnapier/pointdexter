@@ -203,6 +203,7 @@ pub fn iterative_reject(
     let mut keep: Vec<usize> = (0..t.len()).collect();
     let mut rejected: Vec<usize> = Vec::new();
 
+
     loop {
         // Subset data
         let t_f: Vec<f64> = keep.iter().map(|&i| t[i]).collect();
@@ -263,11 +264,11 @@ pub fn iterative_reject(
         }
 
         // Stop if not enough data left
-        if keep.len() < min_points {
+        if keep.len() < min_unique_times {
             return Err(format!(
                 "Stopped: not enough points left ({} < {}).",
                 keep.len(),
-                min_points
+                min_unique_times
             ));
         }
     }
@@ -588,7 +589,7 @@ pub fn gather_cluster_data(clust: &Cluster, detections: &Vec<Detection>, central
     // Gather the data for the detections in this cluster, to be used for model fitting.
     let ast_ucty: Vec<f64> = clust.local_intids
         .iter()
-        .map(|id| detections[*id as usize].ast_ucty.unwrap_or(0.2))
+        .map(|id| detections[*id as usize].ast_ucty.unwrap_or(0.2 * (1. / 3600.) * std::f64::consts::PI / 180.0))
         .collect();
     let theta_x : Vec<f64> = clust.local_thetas
         .iter()

@@ -31,8 +31,8 @@ use pointdexter::InitialCondition;
 
 const MAX_DT: f64 = 4000.0; // days
 const MIN_UNIQUE_TIMES: usize = 12;
-const MIN_POINTS_PER_CELL: usize = 4;
-const MIN_NIGHTS: usize = 4;
+const MIN_POINTS_PER_CELL: usize = 6;
+const MIN_NIGHTS: usize = 6;
 
 const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / PI;
 

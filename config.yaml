@@ -6,8 +6,8 @@ min_duration: 20.0
 
 spice_path: "/Users/kjnapier/data/spice"
 
-detection_catalog: "/Users/kjnapier/pointdexter/data/fakes.csv"
-# detection_catalog: "/Users/kjnapier/pointdexter/data/x3-catalog-kev.csv"
+# detection_catalog: "/Users/kjnapier/pointdexter/data/fakes.csv"
+detection_catalog: "/Users/kjnapier/pointdexter/data/x3-catalog-kev.csv"
 
 
 initial_conditions_file: "/Users/kjnapier/pointdexter/data/ics_r>35_4month_30arcsec.csv"
