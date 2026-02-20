@@ -46,14 +46,24 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
     }
 
     enum StringCol<'a> {
-        Str(&'a StringChunked),
+        Utf8(&'a StringChunked),
         U8(&'a UInt8Chunked),
+        I64(&'a Int64Chunked),
+        I32(&'a Int32Chunked),
+        U64(&'a UInt64Chunked),
+        U32(&'a UInt32Chunked),
+        // If you ever have categorical, easiest is to cast beforehand (see note below)
     }
+
     impl<'a> StringCol<'a> {
         fn get(&self, idx: usize) -> Option<String> {
             match self {
-                Self::Str(ca) => ca.get(idx).map(str::to_owned),
+                Self::Utf8(ca) => ca.get(idx).map(str::to_owned),
                 Self::U8(ca) => ca.get(idx).map(|b| (b as char).to_string()),
+                Self::I64(ca) => ca.get(idx).map(|v| v.to_string()),
+                Self::I32(ca) => ca.get(idx).map(|v| v.to_string()),
+                Self::U64(ca) => ca.get(idx).map(|v| v.to_string()),
+                Self::U32(ca) => ca.get(idx).map(|v| v.to_string()),
             }
         }
     }
@@ -65,16 +75,64 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
         let s = col_series(df, name)?;
 
         if let Ok(ca) = s.str() {
-            return Ok(Some(StringCol::Str(ca)));
+            return Ok(Some(StringCol::Utf8(ca)));
         }
         if let Ok(ca) = s.u8() {
             return Ok(Some(StringCol::U8(ca)));
         }
+        if let Ok(ca) = s.i64() {
+            return Ok(Some(StringCol::I64(ca)));
+        }
+        if let Ok(ca) = s.i32() {
+            return Ok(Some(StringCol::I32(ca)));
+        }
+        if let Ok(ca) = s.u64() {
+            return Ok(Some(StringCol::U64(ca)));
+        }
+        if let Ok(ca) = s.u32() {
+            return Ok(Some(StringCol::U32(ca)));
+        }
 
         Err(PolarsError::ComputeError(
-            format!("Column '{name}' must be String or UInt8.").into(),
+            format!(
+                "Column '{name}' must be Utf8 or integer type (i64/i32/u64/u32/u8). Got {:?}.",
+                s.dtype()
+            )
+            .into(),
         ))
     }
+
+
+    // enum StringCol<'a> {
+    //     Str(&'a StringChunked),
+    //     U8(&'a UInt8Chunked),
+    // }
+    // impl<'a> StringCol<'a> {
+    //     fn get(&self, idx: usize) -> Option<String> {
+    //         match self {
+    //             Self::Str(ca) => ca.get(idx).map(str::to_owned),
+    //             Self::U8(ca) => ca.get(idx).map(|b| (b as char).to_string()),
+    //         }
+    //     }
+    // }
+
+    // fn opt_string_like<'a>(df: &'a DataFrame, name: &str) -> PolarsResult<Option<StringCol<'a>>> {
+    //     if !has_col(df, name) {
+    //         return Ok(None);
+    //     }
+    //     let s = col_series(df, name)?;
+
+    //     if let Ok(ca) = s.str() {
+    //         return Ok(Some(StringCol::Str(ca)));
+    //     }
+    //     if let Ok(ca) = s.u8() {
+    //         return Ok(Some(StringCol::U8(ca)));
+    //     }
+
+    //     Err(PolarsError::ComputeError(
+    //         format!("Column '{name}' must be String or UInt8.").into(),
+    //     ))
+    // }
 
     // ---------- schema checks ----------
     for &name in &["ra", "dec", "epoch"] {
@@ -142,7 +200,11 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
     let magnitude = opt_f64(&df, "mag")?;
     let mag_ucty = opt_f64(&df, "mag_ucty")?;
     let filter = opt_string_like(&df, "filter")?;
+
+    // detid could come in as a string or an int, so we'll just treat it as a string either way.
     let detid = opt_string_like(&df, "detid")?;
+    // get the type of the detid column if it exists, and convert to StringCol
+
     let trackid = opt_string_like(&df, "trackid")?;
     let objid = opt_string_like(&df, "objid")?;
     let obscode = opt_string_like(&df, "obscode")?;
