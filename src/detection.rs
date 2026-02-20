@@ -40,8 +40,12 @@ pub struct Detection {
     
     pub mag: Option<f64>,
     pub mag_ucty: Option<f64>,
-    pub ast_ucty: Option<f64>,
     pub filter: Option<String>,
+
+    pub ast_ucty: Option<f64>,
+    pub ra_ucty: Option<f64>,
+    pub dec_ucty: Option<f64>,
+    
     pub objid: Option<String>,
     pub obscode: Option<String>,
     
@@ -69,6 +73,8 @@ impl Detection {
             epoch: epoch_jd,
             reference_plane: ReferencePlane::Equatorial,
             ast_ucty: None,
+            ra_ucty: None,
+            dec_ucty: None,
             observer_velocity: None,
             detid: None,
             objid: None,
@@ -127,12 +133,24 @@ impl Detection {
         self.trackid = Some(trackid);
     }
 
+    pub fn set_objid(&mut self, objid: String) {
+        self.objid = Some(objid);
+    }
+
     pub fn set_mag(&mut self, mag: f64) {
         self.mag = Some(mag);
     }
 
     pub fn set_ast_ucty(&mut self, ast_ucty: f64) {
         self.ast_ucty = Some(ast_ucty);
+    }
+
+    pub fn set_ra_ucty(&mut self, ra_ucty: f64) {
+        self.ra_ucty = Some(ra_ucty);
+    }
+
+    pub fn set_dec_ucty(&mut self, dec_ucty: f64) {
+        self.dec_ucty = Some(dec_ucty);
     }
 
     pub fn set_filter(&mut self, filter: String) {
@@ -170,5 +188,10 @@ impl Detection {
     pub fn filter(&self) -> &Option<String> {
         &self.filter
     }
-
+    pub fn ra_ucty(&self) -> &Option<f64> {
+        &self.ra_ucty
+    }
+    pub fn dec_ucty(&self) -> &Option<f64> {
+        &self.dec_ucty
+    }
 }

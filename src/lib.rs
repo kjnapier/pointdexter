@@ -21,3 +21,6 @@ pub mod gauss;
 
 pub mod utils;
     pub use utils::*;
+
+pub mod hpix;
+    pub use hpix::*;

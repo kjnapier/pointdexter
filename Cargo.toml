@@ -35,8 +35,8 @@ indicatif = { version = "0.17", features = ["rayon"] }
 [profile.release]
 # lto = "fat"          # link time optimization
 # codegen-units = 1    # more stable profiles (optional)
-panic = "abort"      # optional
-strip = true         # Strip symbols from the binary (reduces size) [4]
-debug = false        # Ensure debug info is off
+# panic = "abort"      # optional
+# strip = true         # Strip symbols from the binary (reduces size) [4]
+# debug = false        # Ensure debug info is off
 # [profile.release.package."*"]
 # debug = true
