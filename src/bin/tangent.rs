@@ -45,6 +45,39 @@ pub fn build_grid(alphas: &Vec<f64>, betas: &Vec<f64>, pixel_scale: f64) -> Vec<
     grid
 }
 
+// Return grid and the parameters needed to convert back to alpha and beta values.
+pub fn build_grid_and_wcs(alphas: &Vec<f64>, betas: &Vec<f64>, pixel_scale: f64) -> (Vec<Vec<usize>>, f64, f64, f64) {
+    let mut alpha_min = std::f64::INFINITY;
+    let mut alpha_max = std::f64::NEG_INFINITY;
+    let mut beta_min = std::f64::INFINITY;;
+    let mut beta_max = std::f64::NEG_INFINITY;
+    for (alpha, beta) in alphas.iter().zip(betas.iter()) {
+        if *alpha < alpha_min {
+            alpha_min = *alpha;
+        }
+        if *alpha > alpha_max {
+            alpha_max = *alpha;
+        }
+        if *beta < beta_min {
+            beta_min = *beta;
+        }
+        if *beta > beta_max {
+            beta_max = *beta;
+        }
+    }
+    let alpha_bins = ((alpha_max - alpha_min)/pixel_scale).ceil() as usize;
+    let beta_bins = ((beta_max - beta_min)/pixel_scale).ceil() as usize;
+    let mut grid = vec![vec![0; beta_bins]; alpha_bins];
+    for (alpha, beta) in alphas.iter().zip(betas.iter()) {
+        let alpha_idx = ((*alpha - alpha_min)/pixel_scale).floor() as usize;
+        let beta_idx = ((*beta - beta_min)/pixel_scale).floor() as usize;
+        //println!("alpha: {}, beta: {}, alpha_idx: {}, beta_idx: {}", alpha, beta, alpha_idx, beta_idx);
+        grid[alpha_idx][beta_idx] += 1;
+    }
+    //println!("Grid size: {} x {}", alpha_bins, beta_bins);
+    (grid, alpha_min, beta_min, pixel_scale)
+}
+
 pub fn save_grid_png(grid: &Vec<Vec<usize>>, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     use image::{GrayImage, Luma};
     let alpha_bins = grid.len();
@@ -60,7 +93,63 @@ pub fn save_grid_png(grid: &Vec<Vec<usize>>, path: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
+pub fn convolve_peaks(grid: &Vec<Vec<usize>>, peaks: &Vec<(usize, usize)>) -> Vec<usize> {
+    let mut counts: Vec<usize> = Vec::with_capacity(peaks.len());
+    for peak in peaks.iter() {
+        let i = peak.0;
+        let j = peak.1;
+        let mut count_sum = 0;
+        for di in -1..=1 {
+            for dj in -1..=1 {
+                let ni = i as isize + di;
+                let nj = j as isize + dj;
+                if ni < 0 || ni >= grid.len() as isize || nj < 0 || nj >= grid[i].len() as isize {
+                    continue;
+                }
+                count_sum += grid[ni as usize][nj as usize];
+            }
+        }
+        counts.push(count_sum);
+    } 
+    counts
+}
 
+
+pub fn find_local_maxima(grid: &Vec<Vec<usize>>) -> Vec<(usize, usize)> {
+    let mut peaks: Vec<(usize, usize)> = Vec::new();
+    for i in 0..grid.len() {
+        for j in 0..grid[i].len() {
+            let count = grid[i][j];
+            if count == 0 {
+                continue;
+            }
+            let mut is_peak = true;
+            for di in -1..=1 {
+                for dj in -1..=1 {
+                    if di == 0 && dj == 0 {
+                        continue;
+                    }   
+                    let ni = i as isize + di;
+                    let nj = j as isize + dj;
+                    if ni < 0 || ni >= grid.len() as isize || nj < 0 || nj >= grid[i].len() as isize {
+                        continue;
+                    }
+                    if grid[ni as usize][nj as usize] > count {
+                        is_peak = false;
+                        break;
+                    }
+                }
+                if !is_peak {
+                    break;
+                }
+            }
+            if is_peak {
+                peaks.push((i, j));
+            }
+        }
+    }
+    peaks
+}
 
 pub fn sort_detections_into_exposures(detections: &Vec<Detection>) -> Vec<Exposure> {
     // sort the detections by epoch
@@ -103,6 +192,58 @@ pub fn transform_exposures_to_tangent_plane(exposures: &Vec<Exposure>, center: V
     exposures.iter().map(|e| e.transform_to_tangent_plane(center)).collect()
 }
 
+pub fn sync_detections(exposures: &Vec<TangentPlaneExposure>, mu: f64, gamma: f64, gdot: f64, adot: f64, bdot: f64, ref_epoch: f64, ndets: usize) -> (Vec<f64>, Vec<f64>) {
+
+    let mut alphas = Vec::with_capacity(ndets);
+    let mut betas = Vec::with_capacity(ndets); 
+
+    let z0 = 1.0/gamma;
+    
+    let mm_sqr = (mu * gamma * gamma * gamma);
+    for exposure in exposures.iter() {
+
+        // Calculate the mean theta_x and theta_y across all detections in this exposure.
+        let mut mean_theta_x = 0.0;
+        let mut mean_theta_y = 0.0;
+        let mut count = 0;
+        for tx in exposure.theta_x.iter() {
+            mean_theta_x += tx;
+            count += 1;
+        }
+        for ty in exposure.theta_y.iter() {
+            mean_theta_y += ty;
+        }
+        mean_theta_x /= count as f64;
+        mean_theta_y /= count as f64;
+
+        let mut synced_exposure: Vec<(f64, f64)> = Vec::new();
+        let t = exposure.epoch - ref_epoch;
+
+        let rho2 = (1.0 + mean_theta_x * mean_theta_x + mean_theta_y * mean_theta_y)*(z0 - exposure.xyz_e.z).powi(2);
+        let rho = rho2.sqrt();
+
+        // Improve light time correction at some point.
+        let dt = rho/SPEED_OF_LIGHT;
+
+        let t = exposure.epoch - ref_epoch;
+        let tp = t - dt;
+        let f = (1.0 - 0.5 * mm_sqr * tp * tp);
+        let g = tp;
+        let fac = (1.0 + g/f * gdot - gamma/f * exposure.xyz_e.z);
+
+        for (theta_x, theta_y) in exposure.theta_x.iter().zip(exposure.theta_y.iter()) {
+            let phi_x = theta_x * fac + gamma/f * exposure.xyz_e.x;
+            let phi_y = theta_y * fac + gamma/f * exposure.xyz_e.y;
+            let alpha = phi_x - g/f * adot;
+            let beta = phi_y - g/f * bdot;
+            //println!("Exposure {}: alpha = {}, beta = {}", exposure.id, alpha, beta);
+            alphas.push(alpha);
+            betas.push(beta);
+        }
+    }
+    (alphas, betas)
+}
+
 pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     // We need to make this more flexible.
     let args = Cli::try_parse()?;
@@ -116,18 +257,12 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
 
     let spacerock_origin = Origin::from_str("ssb")?;
     let mu = spacerock_origin.mu();
-    println!("Loaded SPICE kernels. Solar system barycenter mu: {}", mu);
+    //println!("Loaded SPICE kernels. Solar system barycenter mu: {}", mu);
 
     let mut detections = load_detections(&config.detection_catalog, &config.orbit_reference_plane, &kernel)?;
     let exposures = sort_detections_into_exposures(&detections);
-    println!("Loaded {} exposures", exposures.len());
+    //println!("Loaded {} exposures", exposures.len());
 
-    let mut sum = 0;
-    for exposure in exposures.iter() {
-        println!("Exposure {} has {} detections at epoch {}", exposure.id, exposure.detections.len(), exposure.epoch);
-        sum += exposure.detections.len();
-    }  
-    println!("Total detections: {}", sum);
 
     //let ref_vec = exposures[0].detections[0];
     // Calculate the reference vector as the mean of the detections in all exposures.
@@ -149,77 +284,58 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
         tangent_exposures.push(tangent_exposure);
     }
 
+    let epsilon = config.epsilon_arcsec;
+    let pixel_scale = epsilon / 3.0 * std::f64::consts::PI / (180.0 * 3600.0); // convert arcsec to radians
+    
     let ref_epoch = config.reference_epoch;
     let gamma = 1.0/40.0; 
-    let z0 = 1.0/gamma;
     let gdot = 0.0; 
-    let GMtot = mu;
-
-    let mm_sqr = (GMtot * gamma * gamma * gamma);
-
-    // Calculate the mean theta_x and theta_y across all exposures.
-    let mut mean_theta_x = 0.0;
-    let mut mean_theta_y = 0.0;
-    let mut count = 0;
-    for exposure in tangent_exposures.iter() {
-        for tx in exposure.theta_x.iter() {
-            mean_theta_x += tx;
-            count += 1;
-        }
-        for ty in exposure.theta_y.iter() {
-            mean_theta_y += ty;
-        }
-    }
-    mean_theta_x /= count as f64;
-    mean_theta_y /= count as f64;
-
     let adot = 24.0 * (0.5/3600.0) * std::f64::consts::PI/180.0; // 0.5 arcsec/day in radians/day 
     let bdot = 24.0 * (0.1/3600.0) * std::f64::consts::PI/180.0; // 0.1 arcsec/day in radians/day
     
-
-    let mut alphas = Vec::with_capacity(count);
-    let mut betas = Vec::with_capacity(count);
-
     println!("Calculating alpha and beta for each detection...");
-    let start = std::time::Instant::now();
     
-    for exposure in tangent_exposures.iter() {
-        let rho2 = (1.0 + mean_theta_x * mean_theta_x + mean_theta_y * mean_theta_y)*(z0 - exposure.xyz_e.z).powi(2);
-        let rho = rho2.sqrt();
-
-        // Improve light time correction at some point.
-        let dt = rho/SPEED_OF_LIGHT;
-
-        let t = exposure.epoch - ref_epoch;
-        let tp = t - dt;
-        let f = (1.0 - 0.5 * mm_sqr * tp * tp);
-        let g = tp;
-        let fac = (1.0 + g/f * gdot - gamma/f * exposure.xyz_e.z);
-        for (theta_x, theta_y) in exposure.theta_x.iter().zip(exposure.theta_y.iter()) {
-            let phi_x = theta_x * fac + gamma/f * exposure.xyz_e.x;
-            let phi_y = theta_y * fac + gamma/f * exposure.xyz_e.y;
-            let alpha = phi_x - g/f * adot;
-            let beta = phi_y - g/f * bdot;
-            //println!("Exposure {}: alpha = {}, beta = {}", exposure.id, alpha, beta);
-            alphas.push(alpha);
-            betas.push(beta);
-        }
-    }
-    let duration = start.elapsed();
-    println!("Finished calculating alpha and beta for {} detections in {:?}.", alphas.len(), duration);
-
-    println!("Calculated alpha and beta for {} detections", alphas.len());
-
-    // Build the grid and save it as a PNG
-    // set pixel_scale to be 30 arcseconds per pixel in radians
-    let pixel_scale = 30.0 * (std::f64::consts::PI/180.0) / 3600.0;
+    let start_time = std::time::Instant::now();
+    // Now sync the detections to the reference epoch and calculate alpha and beta for each detection.
+    let (alphas, betas) = sync_detections(&tangent_exposures, mu, gamma, gdot, adot, bdot, ref_epoch, count);
     
-    let grid = build_grid(&alphas, &betas, pixel_scale);
-    save_grid_png(&grid, "tangent_plane.png")?;
+    
+        
+    let (grid, alpha_min, beta_min, pixel_scale) = build_grid_and_wcs(&alphas, &betas, pixel_scale);
+    let duration = start_time.elapsed();    
+    println!("completed in {} seconds", duration.as_secs_f64());
+    //save_grid_png(&grid, "tangent_plane.png")?;
 
-    // For a set of initial conditions:
-        // Find peaks
-        // Save the peaks to a file for later analysis.
+    let peaks = find_local_maxima(&grid);
+    println!("Found {} peaks in the grid", peaks.len());
+
+    let convolved_counts = convolve_peaks(&grid, &peaks);
+    println!("Convolved counts for {} peaks", convolved_counts.len());
+    
+
+    // Sort peaks by convolved counts and print the top 10
+    let mut peak_counts: Vec<((usize, usize), usize)> = peaks.iter().zip(convolved_counts.iter()).map(|(peak, count)| (*peak, *count)).collect();
+    peak_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    
+
+    // println!("Top 10 peaks:");
+    // for i in 0..10.min(peak_counts.len()) {
+    //     let (peak, count) = peak_counts[i];
+    //     println!("Peak at grid position ({}, {}) with convolved count {}", peak.0, peak.1, count);
+    // }
+
+    // // Count the number of peaks with convolved count above a threshold (e.g. 5)
+    // let threshold = 12;
+    // let significant_peaks = peak_counts.iter().filter(|(_, count)| *count >= threshold).count();
+    // println!("Number of peaks with convolved count >= {}: {}", threshold, significant_peaks);
+
+    // // Now convert the significant peaks back to alpha and beta values and print them
+    // println!("Significant peaks (alpha, beta, convolved count):");
+    // for (peak, count) in peak_counts.iter().filter(|(_, count)| *count >= threshold) {
+    //     let alpha = (peak.0 as f64 + 0.5) * pixel_scale + alpha_min; // add 0.5 to get the center of the pixel
+    //     let beta = (peak.1 as f64 + 0.5) * pixel_scale + beta_min; // add 0.5 to get the center of the pixel
+    //     println!("({}, {}, {})", alpha, beta, count);
+    // }
 
     
     
