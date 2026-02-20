@@ -43,6 +43,7 @@ pub struct Exposure {
 impl Exposure {
 
     pub fn transform_to_tangent_plane(&self, center: Vector3<f64>) -> TangentPlaneExposure {
+        // Implement logic here.
         let theta_x = self.detections.iter().map(|d| (d - center).dot(&Vector3::x())).collect();
         let theta_y = self.detections.iter().map(|d| (d - center).dot(&Vector3::y())).collect();
         TangentPlaneExposure {
