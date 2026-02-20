@@ -2,6 +2,8 @@ use crate::ReferencePlane;
 
 use nalgebra::{Vector3, DMatrix, Matrix3};
 
+use crate::xyz_to_proj_matrix;
+
 // equatorial_to_ecliptic_matrix and ecliptic_to_equatorial_matrix can be used for conversions
 pub const EQUATORIAL_TO_ECLIPTIC: Matrix3<f64> = Matrix3::new(1.0, 0.0, 0.0,
                                                               0.0, 0.917_482_062_069_181_8, 0.397_777_155_931_913_7,
@@ -18,10 +20,8 @@ pub struct TangentPlaneExposure {
     pub id: String,
     pub epoch: f64,
 
-    pub xe: f64,
-    pub ye: f64,
-    pub ze: f64,
-
+    pub xyz_e: Vector3<f64>,
+    
     pub theta_x: Vec<f64>,
     pub theta_y: Vec<f64>,
 }
@@ -42,16 +42,30 @@ pub struct Exposure {
 
 impl Exposure {
 
-    pub fn transform_to_tangent_plane(&self, center: Vector3<f64>) -> TangentPlaneExposure {
-        // Implement logic here.
-        let theta_x = self.detections.iter().map(|d| (d - center).dot(&Vector3::x())).collect();
-        let theta_y = self.detections.iter().map(|d| (d - center).dot(&Vector3::y())).collect();
+    pub fn transform_to_tangent_plane(&self, ref_vec: Vector3<f64>) -> TangentPlaneExposure {
+
+        let mut rot = xyz_to_proj_matrix(ref_vec);
+
+        let mut theta_x = Vec::new();
+        let mut theta_y = Vec::new();
+
+        for det in self.detections.iter() {
+            let proj = rot * det;
+
+            let tx = proj[0]/proj[2];
+            let ty = proj[1]/proj[2];
+            
+            theta_x.push(tx);
+            theta_y.push(ty);
+
+        }
+
+        let xyz_e = rot * self.observer_position;
+
         TangentPlaneExposure {
             id: self.id.clone(),
             epoch: self.epoch,
-            xe: self.observer_position.x,  // TODO: THIS IS WRONG
-            ye: self.observer_position.y, // TODO: THIS IS WRONG
-            ze: self.observer_position.z, // TODO: THIS IS WRONG
+            xyz_e,
             theta_x,
             theta_y,
         }

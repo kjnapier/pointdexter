@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 
-spacerocks = { path = "/Users/kjnapier/spacerocks" }
+spacerocks = { git = "https://github.com/kjnapier/spacerocks" }
 polars = { version = "0.50.0", features = ["lazy"] }
 nalgebra = { version = "0.32.2" }
 
