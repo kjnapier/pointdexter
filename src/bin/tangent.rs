@@ -13,6 +13,54 @@ use spacerocks::coordinates::Origin;
 use spacerocks::time::Time;
 use spacerocks::constants::SPEED_OF_LIGHT;
 
+pub fn build_grid(alphas: &Vec<f64>, betas: &Vec<f64>, pixel_scale: f64) -> Vec<Vec<usize>> {
+    let mut alpha_min = std::f64::INFINITY;
+    let mut alpha_max = std::f64::NEG_INFINITY;
+    let mut beta_min = std::f64::INFINITY;;
+    let mut beta_max = std::f64::NEG_INFINITY;
+    for (alpha, beta) in alphas.iter().zip(betas.iter()) {
+        if *alpha < alpha_min {
+            alpha_min = *alpha;
+        }
+        if *alpha > alpha_max {
+            alpha_max = *alpha;
+        }
+        if *beta < beta_min {
+            beta_min = *beta;
+        }
+        if *beta > beta_max {
+            beta_max = *beta;
+        }
+    }
+    let alpha_bins = ((alpha_max - alpha_min)/pixel_scale).ceil() as usize;
+    let beta_bins = ((beta_max - beta_min)/pixel_scale).ceil() as usize;
+    let mut grid = vec![vec![0; beta_bins]; alpha_bins];
+    for (alpha, beta) in alphas.iter().zip(betas.iter()) {
+        let alpha_idx = ((*alpha - alpha_min)/pixel_scale).floor() as usize;
+        let beta_idx = ((*beta - beta_min)/pixel_scale).floor() as usize;
+        //println!("alpha: {}, beta: {}, alpha_idx: {}, beta_idx: {}", alpha, beta, alpha_idx, beta_idx);
+        grid[alpha_idx][beta_idx] += 1;
+    }
+    //println!("Grid size: {} x {}", alpha_bins, beta_bins);
+    grid
+}
+
+pub fn save_grid_png(grid: &Vec<Vec<usize>>, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use image::{GrayImage, Luma};
+    let alpha_bins = grid.len();
+    let beta_bins = grid[0].len();
+    let mut img = GrayImage::new(beta_bins as u32, alpha_bins as u32);
+    for (i, row) in grid.iter().enumerate() {
+        for (j, count) in row.iter().enumerate() {
+            let intensity = (*count as f64 / 10.0).min(1.0) * 255.0; // scale counts to [0, 255], adjust as needed
+            img.put_pixel(j as u32, i as u32, Luma([intensity as u8]));
+        }
+    }
+    img.save(path)?;
+    Ok(())
+}
+
+
 
 pub fn sort_detections_into_exposures(detections: &Vec<Detection>) -> Vec<Exposure> {
     // sort the detections by epoch
@@ -125,12 +173,21 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     mean_theta_x /= count as f64;
     mean_theta_y /= count as f64;
 
-    let adot = 0.1;
-    let bdot = 0.0;
+    let adot = 24.0 * (0.5/3600.0) * std::f64::consts::PI/180.0; // 0.5 arcsec/day in radians/day 
+    let bdot = 24.0 * (0.1/3600.0) * std::f64::consts::PI/180.0; // 0.1 arcsec/day in radians/day
+    
 
+    let mut alphas = Vec::with_capacity(count);
+    let mut betas = Vec::with_capacity(count);
+
+    println!("Calculating alpha and beta for each detection...");
+    let start = std::time::Instant::now();
+    
     for exposure in tangent_exposures.iter() {
         let rho2 = (1.0 + mean_theta_x * mean_theta_x + mean_theta_y * mean_theta_y)*(z0 - exposure.xyz_e.z).powi(2);
         let rho = rho2.sqrt();
+
+        // Improve light time correction at some point.
         let dt = rho/SPEED_OF_LIGHT;
 
         let t = exposure.epoch - ref_epoch;
@@ -143,9 +200,28 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
             let phi_y = theta_y * fac + gamma/f * exposure.xyz_e.y;
             let alpha = phi_x - g/f * adot;
             let beta = phi_y - g/f * bdot;
-            println!("Exposure {}: alpha = {}, beta = {}", exposure.id, alpha, beta);
+            //println!("Exposure {}: alpha = {}, beta = {}", exposure.id, alpha, beta);
+            alphas.push(alpha);
+            betas.push(beta);
         }
     }
+    let duration = start.elapsed();
+    println!("Finished calculating alpha and beta for {} detections in {:?}.", alphas.len(), duration);
+
+    println!("Calculated alpha and beta for {} detections", alphas.len());
+
+    // Build the grid and save it as a PNG
+    // set pixel_scale to be 30 arcseconds per pixel in radians
+    let pixel_scale = 30.0 * (std::f64::consts::PI/180.0) / 3600.0;
+    
+    let grid = build_grid(&alphas, &betas, pixel_scale);
+    save_grid_png(&grid, "tangent_plane.png")?;
+
+    // For a set of initial conditions:
+        // Find peaks
+        // Save the peaks to a file for later analysis.
+
+    
     
    
     Ok(())
