@@ -1,6 +1,17 @@
-use nalgebra::Vector3;
+use crate::ReferencePlane;
 
-use pointdexter::ReferencePlane;
+use nalgebra::{Vector3, DMatrix, Matrix3};
+
+// equatorial_to_ecliptic_matrix and ecliptic_to_equatorial_matrix can be used for conversions
+pub const EQUATORIAL_TO_ECLIPTIC: Matrix3<f64> = Matrix3::new(1.0, 0.0, 0.0,
+                                                              0.0, 0.917_482_062_069_181_8, 0.397_777_155_931_913_7,
+                                                              0.0, -0.397_777_155_931_913_7, 0.917_482_062_069_181_8);
+
+
+pub const ECLIPTIC_TO_EQUATORIAL: Matrix3<f64> = Matrix3::new(1.0, 0.0, 0.0,
+                                                              0.0, 0.917_482_062_069_181_8, -0.397_777_155_931_913_7,
+                                                              0.0, 0.397_777_155_931_913_7, 0.917_482_062_069_181_8);
+
 
 
 pub struct TangentPlaneExposure {

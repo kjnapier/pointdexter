@@ -24,3 +24,6 @@ pub mod utils;
 
 pub mod hpix;
     pub use hpix::*;
+
+pub mod exposure;
+    pub use exposure::*;
