@@ -1,4 +1,4 @@
-epsilon_arcsec: 2.0
+epsilon_arcsec: 3.0
 min_detections: 8
 min_nites: 6
 max_detections: 100

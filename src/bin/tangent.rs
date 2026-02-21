@@ -13,7 +13,11 @@ use spacerocks::coordinates::Origin;
 use spacerocks::time::Time;
 use spacerocks::constants::SPEED_OF_LIGHT;
 
-use std::collections::HashMap;
+// use std::collections::HashMap;
+use hashbrown::HashMap;
+use ahash::RandomState;
+
+
 
 
 pub fn build_grid(alphas: &Vec<f64>, betas: &Vec<f64>, pixel_scale: f64) -> Vec<Vec<usize>> {
@@ -81,16 +85,13 @@ pub fn build_grid_and_wcs(alphas: &Vec<f64>, betas: &Vec<f64>, pixel_scale: f64)
     (grid, alpha_min, beta_min, pixel_scale)
 }
 
+pub type CountsMap = HashMap<u64, u32, RandomState>;
 // Return sparse counts + WCS params + bin counts
-pub fn build_grid_sparse(
-    alphas: &[f64],
-    betas: &[f64],
-    pixel_scale: f64,
-) -> (HashMap<u64, u32>, f64, f64, f64, usize, usize) {
+pub fn build_grid_sparse(alphas: &[f64], betas: &[f64], pixel_scale: f64) -> (CountsMap, f64, f64, f64, usize, usize) {
     debug_assert_eq!(alphas.len(), betas.len());
     let n = alphas.len();
     if n == 0 {
-        return (HashMap::new(), 0.0, 0.0, pixel_scale, 0, 0);
+        return (CountsMap::with_hasher(RandomState::new()), 0.0, 0.0, pixel_scale, 0, 0);
     }
 
     let mut alpha_min = alphas[0];
@@ -111,8 +112,10 @@ pub fn build_grid_sparse(
     let alpha_bins = ((alpha_max - alpha_min) * inv).ceil() as usize;
     let beta_bins  = ((beta_max  - beta_min)  * inv).ceil() as usize;
 
-    // Heuristic capacity: around number of points (most points hit distinct pixels at small scale)
-    let mut counts: HashMap<u64, u32> = HashMap::with_capacity(n * 2);
+    
+    // let mut counts: HashMap<u64, u32> = HashMap::with_capacity(n * 2);
+    let mut counts: CountsMap = CountsMap::with_capacity_and_hasher(n * 2, RandomState::new());
+
 
     for (&a, &b) in alphas.iter().zip(betas.iter()) {
         let mut ai = ((a - alpha_min) * inv) as isize; // trunc toward 0; OK since >=0 typically
@@ -144,7 +147,7 @@ fn unpack(key: u64) -> (u32, u32) {
 
 /// Sum counts in the 3x3 neighborhood around each peak (including the center).
 pub fn convolve_peaks_sparse(
-    counts: &HashMap<u64, u32>,
+    counts: &CountsMap,
     peaks: &[(u32, u32)],
     alpha_bins: u32,
     beta_bins: u32,
@@ -178,7 +181,7 @@ pub fn convolve_peaks_sparse(
 /// A cell is a peak if no neighbor in its 8-neighborhood has a strictly larger count.
 /// (Ties are allowed.)
 pub fn find_local_maxima_sparse(
-    counts: &HashMap<u64, u32>,
+    counts: &CountsMap,
     alpha_bins: u32,
     beta_bins: u32,
     min_count: u32, // pass 3 to "skip <= 2"
@@ -386,6 +389,9 @@ pub fn sync_detections(exposures: &Vec<TangentPlaneExposure>, mu: f64, gamma: f6
     (alphas, betas)
 }
 
+
+
+
 pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     // We need to make this more flexible.
     let args = Cli::try_parse()?;
@@ -440,16 +446,11 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
     // Now sync the detections to the reference epoch and calculate alpha and beta for each detection.
     let (alphas, betas) = sync_detections(&tangent_exposures, mu, gamma, gdot, adot, bdot, ref_epoch, count);
-    
-    
-        
-    // let (grid, alpha_min, beta_min, pixel_scale) = build_grid_and_wcs(&alphas, &betas, pixel_scale);
-    let (grid, alpha_min, beta_min, pixel_scale, alpha_bins, beta_bins) = build_grid_sparse(&alphas, &betas, pixel_scale);
 
-    let min_count = 3; // adjust as needed
-    let peaks = find_local_maxima_sparse(&grid, alpha_bins as u32, beta_bins as u32, 3);
-    let convolved_counts = convolve_peaks_sparse(&grid, &peaks, alpha_bins as u32, beta_bins as u32);
-
+    let (counts, alpha_min, beta_min, pixel_scale, alpha_bins, beta_bins) = build_grid_sparse(&alphas, &betas, pixel_scale);
+    let min_count = 3;
+    let peaks = find_local_maxima_sparse(&counts, alpha_bins as u32, beta_bins as u32, min_count);
+    let convolved_counts = convolve_peaks_sparse(&counts, &peaks, alpha_bins as u32, beta_bins as u32);
     
     // save_grid_png(&grid, "tangent_plane.png")?;
 
@@ -460,7 +461,7 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     // println!("Convolved counts for {} peaks", convolved_counts.len());
 
     let duration = start_time.elapsed();    
-    println!("completed in {} seconds", duration.as_secs_f64());
+    println!("completed in {:?}", duration);
     
 
     // // Sort peaks by convolved counts and print the top 10

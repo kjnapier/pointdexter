@@ -31,6 +31,10 @@ plotly = { version = "*" , features = ["kaleido"] }
 ordered-float = "4"
 indicatif = { version = "0.17", features = ["rayon"] }
 
+hashbrown = "0.14"
+ahash = "0.8"
+
+
 
 [profile.release]
 # lto = "fat"          # link time optimization
