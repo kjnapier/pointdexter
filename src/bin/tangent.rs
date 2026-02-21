@@ -13,6 +13,9 @@ use spacerocks::coordinates::Origin;
 use spacerocks::time::Time;
 use spacerocks::constants::SPEED_OF_LIGHT;
 
+use std::collections::HashMap;
+
+
 pub fn build_grid(alphas: &Vec<f64>, betas: &Vec<f64>, pixel_scale: f64) -> Vec<Vec<usize>> {
     let mut alpha_min = std::f64::INFINITY;
     let mut alpha_max = std::f64::NEG_INFINITY;
@@ -78,6 +81,145 @@ pub fn build_grid_and_wcs(alphas: &Vec<f64>, betas: &Vec<f64>, pixel_scale: f64)
     (grid, alpha_min, beta_min, pixel_scale)
 }
 
+// Return sparse counts + WCS params + bin counts
+pub fn build_grid_sparse(
+    alphas: &[f64],
+    betas: &[f64],
+    pixel_scale: f64,
+) -> (HashMap<u64, u32>, f64, f64, f64, usize, usize) {
+    debug_assert_eq!(alphas.len(), betas.len());
+    let n = alphas.len();
+    if n == 0 {
+        return (HashMap::new(), 0.0, 0.0, pixel_scale, 0, 0);
+    }
+
+    let mut alpha_min = alphas[0];
+    let mut alpha_max = alphas[0];
+    let mut beta_min  = betas[0];
+    let mut beta_max  = betas[0];
+
+    for i in 1..n {
+        let a = alphas[i];
+        let b = betas[i];
+        if a < alpha_min { alpha_min = a; }
+        if a > alpha_max { alpha_max = a; }
+        if b < beta_min  { beta_min  = b; }
+        if b > beta_max  { beta_max  = b; }
+    }
+
+    let inv = 1.0 / pixel_scale;
+    let alpha_bins = ((alpha_max - alpha_min) * inv).ceil() as usize;
+    let beta_bins  = ((beta_max  - beta_min)  * inv).ceil() as usize;
+
+    // Heuristic capacity: around number of points (most points hit distinct pixels at small scale)
+    let mut counts: HashMap<u64, u32> = HashMap::with_capacity(n * 2);
+
+    for (&a, &b) in alphas.iter().zip(betas.iter()) {
+        let mut ai = ((a - alpha_min) * inv) as isize; // trunc toward 0; OK since >=0 typically
+        let mut bi = ((b - beta_min)  * inv) as isize;
+
+        // Clamp just in case of edge/rounding issues
+        if ai < 0 { ai = 0; }
+        if bi < 0 { bi = 0; }
+        if ai as usize >= alpha_bins { ai = alpha_bins.saturating_sub(1) as isize; }
+        if bi as usize >= beta_bins  { bi = beta_bins.saturating_sub(1)  as isize; }
+
+        let key = pack(ai as u32, bi as u32);
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    (counts, alpha_min, beta_min, pixel_scale, alpha_bins, beta_bins)
+}
+
+
+#[inline]
+fn pack(i: u32, j: u32) -> u64 {
+    ((i as u64) << 32) | (j as u64)
+}
+
+#[inline]
+fn unpack(key: u64) -> (u32, u32) {
+    ((key >> 32) as u32, (key & 0xFFFF_FFFF) as u32)
+}
+
+/// Sum counts in the 3x3 neighborhood around each peak (including the center).
+pub fn convolve_peaks_sparse(
+    counts: &HashMap<u64, u32>,
+    peaks: &[(u32, u32)],
+    alpha_bins: u32,
+    beta_bins: u32,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(peaks.len());
+
+    for &(i, j) in peaks {
+        let mut sum: u32 = 0;
+
+        // neighborhood bounds (avoid per-neighbor checks where possible)
+        let i0 = i.saturating_sub(1);
+        let j0 = j.saturating_sub(1);
+        let i1 = (i + 1).min(alpha_bins.saturating_sub(1));
+        let j1 = (j + 1).min(beta_bins.saturating_sub(1));
+
+        for ni in i0..=i1 {
+            for nj in j0..=j1 {
+                if let Some(&v) = counts.get(&pack(ni, nj)) {
+                    sum += v;
+                }
+            }
+        }
+
+        out.push(sum);
+    }
+
+    out
+}
+
+/// Find local maxima among occupied cells, skipping any cell with count <= min_count.
+/// A cell is a peak if no neighbor in its 8-neighborhood has a strictly larger count.
+/// (Ties are allowed.)
+pub fn find_local_maxima_sparse(
+    counts: &HashMap<u64, u32>,
+    alpha_bins: u32,
+    beta_bins: u32,
+    min_count: u32, // pass 3 to "skip <= 2"
+) -> Vec<(u32, u32)> {
+    let mut peaks: Vec<(u32, u32)> = Vec::new();
+
+    for (&key, &count) in counts.iter() {
+        if count < min_count {
+            continue;
+        }
+
+        let (i, j) = unpack(key);
+
+        let i0 = i.saturating_sub(1);
+        let j0 = j.saturating_sub(1);
+        let i1 = (i + 1).min(alpha_bins.saturating_sub(1));
+        let j1 = (j + 1).min(beta_bins.saturating_sub(1));
+
+        let mut is_peak = true;
+
+        'nbrs: for ni in i0..=i1 {
+            for nj in j0..=j1 {
+                if ni == i && nj == j {
+                    continue;
+                }
+                if let Some(&v) = counts.get(&pack(ni, nj)) {
+                    if v > count {
+                        is_peak = false;
+                        break 'nbrs;
+                    }
+                }
+            }
+        }
+
+        if is_peak {
+            peaks.push((i, j));
+        }
+    }
+
+    peaks
+}
 pub fn save_grid_png(grid: &Vec<Vec<usize>>, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     use image::{GrayImage, Luma};
     let alpha_bins = grid.len();
@@ -301,21 +443,29 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     
     
         
-    let (grid, alpha_min, beta_min, pixel_scale) = build_grid_and_wcs(&alphas, &betas, pixel_scale);
+    // let (grid, alpha_min, beta_min, pixel_scale) = build_grid_and_wcs(&alphas, &betas, pixel_scale);
+    let (grid, alpha_min, beta_min, pixel_scale, alpha_bins, beta_bins) = build_grid_sparse(&alphas, &betas, pixel_scale);
+
+    let min_count = 3; // adjust as needed
+    let peaks = find_local_maxima_sparse(&grid, alpha_bins as u32, beta_bins as u32, 3);
+    let convolved_counts = convolve_peaks_sparse(&grid, &peaks, alpha_bins as u32, beta_bins as u32);
+
+    
+    // save_grid_png(&grid, "tangent_plane.png")?;
+
+    // // let peaks = find_local_maxima(&grid);
+    // println!("Found {} peaks in the grid", peaks.len());
+
+    // let convolved_counts = convolve_peaks(&grid, &peaks);
+    // println!("Convolved counts for {} peaks", convolved_counts.len());
+
     let duration = start_time.elapsed();    
     println!("completed in {} seconds", duration.as_secs_f64());
-    //save_grid_png(&grid, "tangent_plane.png")?;
-
-    let peaks = find_local_maxima(&grid);
-    println!("Found {} peaks in the grid", peaks.len());
-
-    let convolved_counts = convolve_peaks(&grid, &peaks);
-    println!("Convolved counts for {} peaks", convolved_counts.len());
     
 
-    // Sort peaks by convolved counts and print the top 10
-    let mut peak_counts: Vec<((usize, usize), usize)> = peaks.iter().zip(convolved_counts.iter()).map(|(peak, count)| (*peak, *count)).collect();
-    peak_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    // // Sort peaks by convolved counts and print the top 10
+    // let mut peak_counts: Vec<((usize, usize), usize)> = peaks.iter().zip(convolved_counts.iter()).map(|(peak, count)| (*peak, *count)).collect();
+    // peak_counts.sort_by(|a, b| b.1.cmp(&a.1));
     
 
     // println!("Top 10 peaks:");
@@ -329,7 +479,7 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     // let significant_peaks = peak_counts.iter().filter(|(_, count)| *count >= threshold).count();
     // println!("Number of peaks with convolved count >= {}: {}", threshold, significant_peaks);
 
-    // // Now convert the significant peaks back to alpha and beta values and print them
+    // Now convert the significant peaks back to alpha and beta values and print them
     // println!("Significant peaks (alpha, beta, convolved count):");
     // for (peak, count) in peak_counts.iter().filter(|(_, count)| *count >= threshold) {
     //     let alpha = (peak.0 as f64 + 0.5) * pixel_scale + alpha_min; // add 0.5 to get the center of the pixel
