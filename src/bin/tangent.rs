@@ -2,6 +2,7 @@ use pointdexter::cli::{Config, Cli};
 use pointdexter::Exposure;
 use pointdexter::load_detections;
 use pointdexter::xyz_to_proj_matrix;
+use pointdexter::load_initial_conditions;
 
 use spacerocks::{SpiceKernel};
 use pointdexter::Detection;
@@ -348,6 +349,7 @@ pub fn sync_detections(exposures: &Vec<TangentPlaneExposure>, mu: f64, gamma: f6
     for exposure in exposures.iter() {
 
         // Calculate the mean theta_x and theta_y across all detections in this exposure.
+        // This can be calculated up front. 
         let mut mean_theta_x = 0.0;
         let mut mean_theta_y = 0.0;
         let mut count = 0;
@@ -390,8 +392,6 @@ pub fn sync_detections(exposures: &Vec<TangentPlaneExposure>, mu: f64, gamma: f6
 }
 
 
-
-
 pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     // We need to make this more flexible.
     let args = Cli::try_parse()?;
@@ -432,53 +432,109 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
         tangent_exposures.push(tangent_exposure);
     }
 
+    // Let's read a csv file.
+    let mut rdr = csv::Reader::from_path(&config.initial_conditions_file)?;
+
+    // Iterate over each record and save the values to variables. The csv file should have columns: r, vr, vo, psi, id
+    let mut initial_conditions: Vec<(f64, f64, f64, f64, String)> = Vec::new();
+    for result in rdr.records() {
+        // The iterator yields Result<StringRecord, Error>, so we check the error
+        let record = result?;
+        let r = record[0].parse::<f64>()?;
+        let vr = record[1].parse::<f64>()?;
+        let adot = record[2].parse::<f64>()?;
+        let bdot = record[3].parse::<f64>()?;
+        let id = record[4].to_string();        
+        initial_conditions.push((r, vr, adot, bdot, id));
+    }
+
+    // // Print the initial conditions to check that we read them correctly.
+    // println!("Initial conditions:");
+    // for (r, vr, vo, psi, id) in initial_conditions.iter() {
+    //     println!("id: {}, r: {}, vr: {}, vo: {}, psi: {}", id, r, vr, vo, psi);
+    // }
+    
     let epsilon = config.epsilon_arcsec;
     let pixel_scale = epsilon / 3.0 * std::f64::consts::PI / (180.0 * 3600.0); // convert arcsec to radians
     
     let ref_epoch = config.reference_epoch;
-    let gamma = 1.0/40.0; 
+    let time_span = 60.0; // days; TODO: make this configurable    
+    let gamma = 1.0/30.0; 
     let gdot = 0.0; 
-    let adot = 24.0 * (0.5/3600.0) * std::f64::consts::PI/180.0; // 0.5 arcsec/day in radians/day 
-    let bdot = 24.0 * (0.1/3600.0) * std::f64::consts::PI/180.0; // 0.1 arcsec/day in radians/day
-    
-    println!("Calculating alpha and beta for each detection...");
-    
+
+
     let start_time = std::time::Instant::now();
-    // Now sync the detections to the reference epoch and calculate alpha and beta for each detection.
-    let (alphas, betas) = sync_detections(&tangent_exposures, mu, gamma, gdot, adot, bdot, ref_epoch, count);
 
-    let (counts, alpha_min, beta_min, pixel_scale, alpha_bins, beta_bins) = build_grid_sparse(&alphas, &betas, pixel_scale);
-    let min_count = 3;
-    let peaks = find_local_maxima_sparse(&counts, alpha_bins as u32, beta_bins as u32, min_count);
-    let convolved_counts = convolve_peaks_sparse(&counts, &peaks, alpha_bins as u32, beta_bins as u32);
+    //let adot = 24.0 * (0.5/3600.0) * std::f64::consts::PI/180.0; // 0.5 arcsec/day in radians/day 
+    //let bdot = 24.0 * (0.1/3600.0) * std::f64::consts::PI/180.0; // 0.1 arcsec/day in radians/day
+
+    // Now we can loop over our grid of adot and bdot values, 
+    // sync the detections to the reference epoch for each pair, 
+    // build a grid in alpha-beta space, and count the number of detections that fall into each cell.
     
-    // save_grid_png(&grid, "tangent_plane.png")?;
+    let min_count = 3;
 
-    // // let peaks = find_local_maxima(&grid);
-    // println!("Found {} peaks in the grid", peaks.len());
+    for (r, vr, adot, bdot, id) in initial_conditions.iter() {
+        let gamma = 1.0/r;
+        let gdot = vr/r;
+            
+        let (alphas, betas) = sync_detections(&tangent_exposures, mu, gamma, gdot, *adot, *bdot, ref_epoch, count);
+        let (counts, alpha_min, beta_min, pixel_scale, alpha_bins, beta_bins) = build_grid_sparse(&alphas, &betas, pixel_scale);
+        let peaks = find_local_maxima_sparse(&counts, alpha_bins as u32, beta_bins as u32, min_count);
+        let convolved_counts = convolve_peaks_sparse(&counts, &peaks, alpha_bins as u32, beta_bins as u32);
+        let mut peak_counts: Vec<((u32, u32), u32)> = peaks.into_iter().zip(convolved_counts.into_iter()).collect();
+        peak_counts.sort_by(|a, b| b.1.cmp(&a.1)); // sort in descending order of convolved count
+        let threshold = 12;
+        let significant_peaks = peak_counts.iter().filter(|(_, count)| *count >= threshold).count();
+        if significant_peaks > 0 {
+            // Print the adot, bdot, and number of significant peaks for this pair.
+            // Units should be in arcsec/day for readability.
+            let adot_arcsec_per_day = adot * 3600.0 * 180.0 / std::f64::consts::PI;
+            let adot_arcsec_per_hour = adot_arcsec_per_day / 24.0;
+            let bdot_arcsec_per_day = bdot * 3600.0 * 180.0 / std::f64::consts::PI;
+            let bdot_arcsec_per_hour = bdot_arcsec_per_day / 24.0;
+            // Find the top peak for this pair and print its alpha, beta, and convolved count.
+            let top_peak = peak_counts.iter().max_by_key(|(_, count)| *count).unwrap();
+            let alpha = (top_peak.0 .0 as f64 + 0.5) * pixel_scale + alpha_min; // add 0.5 to get the center of the pixel
+            let beta = (top_peak.0 .1 as f64 + 0.5) * pixel_scale + beta_min; // add 0.5 to get the center of the pixel
+            println!("adot: {:.3} arcsec/hour, bdot: {:.3} arcsec/hour, top peak: (alpha: {:.6}, beta: {:.6}, convolved count: {}), significant peaks: {}", adot_arcsec_per_hour, bdot_arcsec_per_hour, alpha, beta, top_peak.1, significant_peaks);
+            //println!("adot: {:.3} arcsec/hour, bdot: {:.3} arcsec/hour, significant peaks: {}", adot_arcsec_per_hour, bdot_arcsec_per_hour, significant_peaks);
 
-    // let convolved_counts = convolve_peaks(&grid, &peaks);
-    // println!("Convolved counts for {} peaks", convolved_counts.len());
+        }
+    } 
 
     let duration = start_time.elapsed();    
     println!("completed in {:?}", duration);
+
+    // // Now sync the detections to the reference epoch and calculate alpha and beta for each detection.
+    // let (alphas, betas) = sync_detections(&tangent_exposures, mu, gamma, gdot, adot, bdot, ref_epoch, count);
+
+    // let (counts, alpha_min, beta_min, pixel_scale, alpha_bins, beta_bins) = build_grid_sparse(&alphas, &betas, pixel_scale);
+    
+    // let peaks = find_local_maxima_sparse(&counts, alpha_bins as u32, beta_bins as u32, min_count);
+    // let convolved_counts = convolve_peaks_sparse(&counts, &peaks, alpha_bins as u32, beta_bins as u32);
+    
+    // // save_grid_png(&grid, "tangent_plane.png")?;
     
 
     // // Sort peaks by convolved counts and print the top 10
-    // let mut peak_counts: Vec<((usize, usize), usize)> = peaks.iter().zip(convolved_counts.iter()).map(|(peak, count)| (*peak, *count)).collect();
-    // peak_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    // let mut peak_counts: Vec<((u32, u32), u32)> = peaks.into_iter().zip(convolved_counts.into_iter()).collect();
+    // peak_counts.sort_by(|a, b| b.1.cmp(&a.1)); // sort in descending order of convolved count
     
-
-    // println!("Top 10 peaks:");
-    // for i in 0..10.min(peak_counts.len()) {
-    //     let (peak, count) = peak_counts[i];
-    //     println!("Peak at grid position ({}, {}) with convolved count {}", peak.0, peak.1, count);
+    //  println!("Top 10 peaks (alpha, beta, convolved count):");
+    // for (peak, count) in peak_counts.iter().take(10) {
+    //     let alpha = (peak.0 as f64 + 0.5) * pixel_scale + alpha_min; // add 0.5 to get the center of the pixel
+    //     let beta = (peak.1 as f64 + 0.5) * pixel_scale + beta_min; // add 0.5 to get the center of the pixel
+    //     println!("({}, {}, {})", alpha, beta, count);
     // }
 
     // // Count the number of peaks with convolved count above a threshold (e.g. 5)
     // let threshold = 12;
     // let significant_peaks = peak_counts.iter().filter(|(_, count)| *count >= threshold).count();
     // println!("Number of peaks with convolved count >= {}: {}", threshold, significant_peaks);
+
+    // let duration = start_time.elapsed();    
+    // println!("completed in {:?}", duration);
 
     // Now convert the significant peaks back to alpha and beta values and print them
     // println!("Significant peaks (alpha, beta, convolved count):");

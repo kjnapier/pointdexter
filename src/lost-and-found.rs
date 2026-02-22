@@ -105,3 +105,70 @@
     // if (r_vec[2] / r).asin().abs() > thresh {
     //     return None;
     // }
+
+    // for exposure in tangent_exposures.iter() {
+    //     let rho2 = (1.0 + mean_theta_x * mean_theta_x + mean_theta_y * mean_theta_y)*(z0 - exposure.xyz_e.z).powi(2);
+    //     let rho = rho2.sqrt();
+
+    //     // Improve light time correction at some point.
+    //     let dt = rho/SPEED_OF_LIGHT;
+
+    //     let t = exposure.epoch - ref_epoch;
+    //     let tp = t - dt;
+    //     let f = (1.0 - 0.5 * mm_sqr * tp * tp);
+    //     let g = tp;
+    //     let fac = (1.0 + g/f * gdot - gamma/f * exposure.xyz_e.z);
+    //     for (theta_x, theta_y) in exposure.theta_x.iter().zip(exposure.theta_y.iter()) {
+    //         let phi_x = theta_x * fac + gamma/f * exposure.xyz_e.x;
+    //         let phi_y = theta_y * fac + gamma/f * exposure.xyz_e.y;
+    //         let alpha = phi_x - g/f * adot;
+    //         let beta = phi_y - g/f * bdot;
+    //         //println!("Exposure {}: alpha = {}, beta = {}", exposure.id, alpha, beta);
+    //         alphas.push(alpha);
+    //         betas.push(beta);
+    //     }
+    // }
+
+
+
+    // // We can set the maximum value of adot and bdot based on the value of gamma.
+            
+    // let theta_dot_max = (2.0 * mu * gamma * gamma * gamma).sqrt(); // max angular rate in radians/day
+    // // print the max angular rate in arcsec/hour for readability
+    // println!("theta_dot_max: {:.3} arcsec/hour", theta_dot_max * 3600.0 * 180.0 / std::f64::consts::PI / 24.0);
+    // println!("approx period: {:.2} years", (2.0 * std::f64::consts::PI / theta_dot_max) / 365.25);
+
+    // // Next, we set the step size for our grid in adot and bdot based on the time span
+    // // of our observations and the search radius.
+    // // The units should be radians/day for both adot and bdot, since they represent angular velocities in the tangent plane.    
+    // let dtheta_dot = 3.0 * pixel_scale / time_span; // step size in radians/day, chosen so that the object moves by 3 pixels over the time span of the observations
+    // println!("{}", theta_dot_max/dtheta_dot);
+
+    // // Now we can calculate the number of steps in adot and bdot directions.
+
+    // let adot_steps = 2 * (theta_dot_max / dtheta_dot).ceil() as usize;
+    // let bdot_steps = 2 * (theta_dot_max / dtheta_dot).ceil() as usize;
+
+    // println!("theta_dot_max: {:.3} arcsec/day, dtheta_dot: {:.3} arcsec/day, adot_steps: {}, bdot_steps: {}", 
+    //     theta_dot_max * 3600.0 * 180.0 / std::f64::consts::PI, 
+    //     dtheta_dot * 3600.0 * 180.0 / std::f64::consts::PI, 
+    //     adot_steps, 
+    //     bdot_steps
+    // );
+
+    // // Finally, we can calculate the grid in adot and bdot.
+    // // We will center the grid around 0, so we will have adot and bdot values ranging from -theta_dot_max to +theta_dot_max. 
+    // // We will exclude points such that sqrt(adot^2 + bdot^2) > theta_dot_max to avoid unphysical orbits.
+    // let mut adot_bdot_grid: Vec<(f64, f64)> = Vec::new();
+    // for i in 0..(adot_steps+1) {
+    //     let adot = -theta_dot_max + i as f64 * dtheta_dot;
+    //     for j in 0..(bdot_steps+1) {
+    //         let bdot = -theta_dot_max + j as f64 * dtheta_dot;
+    //         if (adot*adot + bdot*bdot).sqrt() <= theta_dot_max {
+    //             adot_bdot_grid.push((adot, bdot));
+    //         }
+    //     }
+    // }
+    // println!("Grid size: {} adot steps x {} bdot steps = {} total points", adot_steps, bdot_steps, adot_bdot_grid.len());
+    
+    
