@@ -451,6 +451,13 @@ pub fn main() ->  Result<(), Box<dyn std::error::Error>> {
     let min_count = 3;
     let peaks = find_local_maxima_sparse(&counts, alpha_bins as u32, beta_bins as u32, min_count);
     let convolved_counts = convolve_peaks_sparse(&counts, &peaks, alpha_bins as u32, beta_bins as u32);
+
+    // keep only peaks with convolved count above a threshold (e.g. 5)
+    let threshold = 12;
+    let significant_peaks: Vec<((u32, u32), u32)> = peaks.iter().zip(convolved_counts.iter()).filter(|(_, count)| **count >= threshold).map(|(peak, count)| (*peak, *count)).collect();
+    println!("Number of peaks with convolved count >= {}: {}", threshold, significant_peaks.len());
+
+
     
     // save_grid_png(&grid, "tangent_plane.png")?;
 
