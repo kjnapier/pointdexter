@@ -18,6 +18,8 @@ serde = { version = "*", features = ["derive"] }
 image = "0.25"
 itertools = "*"
 
+csv = "*"
+
 rayon = "*"
 
 # anyhow = "*"
