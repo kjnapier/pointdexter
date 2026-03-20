@@ -1,4 +1,4 @@
-epsilon_arcsec: 3.0
+epsilon_arcsec: 1
 min_detections: 8
 min_nites: 6
 max_detections: 100
@@ -7,13 +7,13 @@ min_duration: 20.0
 spice_path: "/Users/kjnapier/data/spice"
 
 # detection_catalog: "/Users/kjnapier/pointdexter/data/fakes.csv"
-detection_catalog: "/Users/kjnapier/pointdexter/data/x3-catalog-kev.csv"
+detection_catalog: "/Users/kjnapier/Desktop/des-x3-no-fakes.csv"
 
 
 initial_conditions_file: "/Users/kjnapier/pointdexter/data/ics_r>35_4month_30arcsec.csv"
 orbit_reference_plane: "ECLIPTIC"
 ic_origin: "SSB"
-reference_epoch: 2457329.1707744873
+reference_epoch: 2457309.1707744873
 ic_type: "spherical"
 
 output_path: "/path/to/output"
