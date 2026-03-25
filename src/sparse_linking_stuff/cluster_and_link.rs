@@ -358,7 +358,7 @@ pub fn try_link(
         };
 
         /// If ANY of the residuals^2 are > 25 (SR residuals function returns the square of the mahalnobis distance),
-        /// the fit fails.
+        /// the fit fails. Need to check on this...
         if sr_fit.residuals.iter().any(|&r| r >= 25.0) {
             continue;
         }

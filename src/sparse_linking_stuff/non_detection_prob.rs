@@ -14,9 +14,6 @@ pub fn detection_efficiency(mag: f64, eta0: f64, m50: f64, sigma: f64) -> f64 {
     eta0 / (1.0 + 10f64.powf((mag - m50) / sigma))
 }
 
-// pub fn detection_efficiency(mag: f64, eta0: f64, m50: f64, sigma: f64) -> f64 {
-//     return (eta0 / 2.0) * (1.0 - (mag - m50) / sigma).tanh();
-// }
 
 // Estimate the angular distance between two points on the sky in degrees
 fn angular_distance_deg(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
