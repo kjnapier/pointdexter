@@ -12,7 +12,8 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use crate::detection::Detection;
 use crate::sync::sync_detection_to_orbit as construct_orbit;
-use crate::sparse_linking_stuff::trajectory::{Trajectory, angular_separation};
+use crate::sparse_linking_stuff::trajectory::Trajectory;
+use crate::sparse_linking_stuff::utils::angular_separation;
 use spacerocks::SpaceRock;
 
 const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / std::f64::consts::PI;

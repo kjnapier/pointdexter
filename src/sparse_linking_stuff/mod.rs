@@ -67,7 +67,6 @@ pub mod orbit;
 pub mod trajectory;
     pub use trajectory::Trajectory;
     pub use trajectory::TrajectoryFilter;
-    pub use trajectory::angular_separation;
     pub use trajectory::find_all_valid_trajectories;
     pub use trajectory::find_center_index;
     pub use trajectory::graph_based_trajectory_search;

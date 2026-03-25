@@ -14,6 +14,7 @@ use spacerocks::SpiceKernel;
 use spacerocks::Time;
 
 pub const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / std::f64::consts::PI;
+pub const RADS_TO_ARCSEC: f64 = 206265.0;
 
 pub fn get_n_random_orbits<'a>(ics: &'a [InitialCondition], n: usize) -> Vec<&'a InitialCondition> {
     // Check if we have enough points to sample
@@ -104,4 +105,16 @@ pub fn residuals(detections: &Vec<&Detection>, rock: &mut SpaceRock, kernel: &Sp
     }
     // Return the residuals and the raw RA and Dec residuals
     Ok((residuals, ra_residuals, dec_residuals))
+}
+
+
+pub fn angular_separation(ref_vec: [f64; 3], vec: [f64; 3]) -> [f64; 2] {
+    let phi0 = ref_vec[1].atan2(ref_vec[0]);
+    let theta0 = ref_vec[2].asin();
+    let phi1 = vec[1].atan2(vec[0]);
+    let theta1 = vec[2].asin();
+    let mut dphi = (phi1 - phi0) * RADS_TO_ARCSEC;
+    dphi *= theta0.cos();
+    let dtheta = (theta1 - theta0) * RADS_TO_ARCSEC;
+    [dphi, dtheta]
 }

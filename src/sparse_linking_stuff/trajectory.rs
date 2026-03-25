@@ -3,13 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use bloomfilter::Bloom;
 use serde::{Serialize, Deserialize};
+use crate::sparse_linking_stuff::utils::*;
 
 use crate::sparse_linking_stuff::Config;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SavedTrajectory {
     pub detection_objids: Vec<String>,
-    pub ic_params: [f64; 4]  // use native type
+    pub ic_params: [f64; 4]  
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,7 +52,7 @@ pub struct TrajectoryFilter {
 pub struct FakeTrajectoryRecord {
     pub fakeid: String,
     pub detection_ids: Vec<usize>,
-    pub ic_id: usize,  // use native type
+    pub ic_id: usize,  
 }
 
 impl Default for TrajectoryFilter {
@@ -228,7 +229,7 @@ pub fn is_valid_trajectory(traj: &[MetaPoint], config: &Config,) -> bool {
     let has_heavy = detection_counts.iter().any(|&d| d >= 12);
     let support_count = detection_counts.iter().filter(|&&d| d > 1).count();
 
-    // Require at least one metapoint with >= 2 detections
+    // Require at least one metapoint with >= 2 detections. We can remove this.
     let has_tracklet = detection_counts.iter().any(|&d| d >= 2);
 
     let valid = total_detections >= config.min_detections 
@@ -308,18 +309,4 @@ pub fn find_center_index(detections: &[MetaPoint]) -> Option<usize> {
             None
         }
     })
-}
-
-
-/// Will be moved to utils
-pub fn angular_separation(ref_vec: [f64; 3], vec: [f64; 3]) -> [f64; 2] {
-    const RADS_TO_ARCSEC: f64 = 206265.0;
-    let phi0 = ref_vec[1].atan2(ref_vec[0]);
-    let theta0 = ref_vec[2].asin();
-    let phi1 = vec[1].atan2(vec[0]);
-    let theta1 = vec[2].asin();
-    let mut dphi = (phi1 - phi0) * RADS_TO_ARCSEC;
-    dphi *= theta0.cos();
-    let dtheta = (theta1 - theta0) * RADS_TO_ARCSEC;
-    [dphi, dtheta]
 }
