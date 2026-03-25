@@ -31,4 +31,5 @@ pub struct Config {
     pub m50: f64,
     pub sigma: f64,
     pub prob_threshold: f64,
+    pub non_detection: bool,
 }

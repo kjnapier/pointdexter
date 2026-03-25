@@ -2,10 +2,21 @@ use crate::chebyshev::{chebyshev_eval, fit_chebyshev_direct};
 use spacerocks::transforms::calc_true_anomaly_from_mean_anomaly;
 use spacerocks::time::Time;
 use spacerocks::transforms::{solve_for_universal_anomaly, stumpff_c, stumpff_s};
+use ordered_float::OrderedFloat;
+
+use crate::sparse_linking_stuff::grid::IcBoundsKey;
 
 fn nice_acos(x: f64) -> f64 {
     x.clamp(-1.0, 1.0).acos()
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum InputFormat {
+    KEV, // (r, vr, vo, psi)
+    QEF, // (q, e, f, psi)
+    KEP, // (a, e, f, psi)
+}
+
 
 #[derive(Debug, Clone)]
 pub struct InitialCondition {
@@ -27,6 +38,9 @@ pub struct InitialCondition {
     pub cos_inc: f64,
     pub sin_latitude_threshold: f64,
     pub energy: f64,
+    pub q: f64,
+    pub e: f64,
+    pub true_anomaly: f64,
 
     // bounds
     pub r_min: Option<f64>,
@@ -118,6 +132,16 @@ impl InitialCondition {
         let h = r * vo;
         let energy = 0.5 * (vr * vr + vo * vo) - mu / r;
         let alpha = -2.0 * energy / mu;
+
+        let radicand = 1.0 + 2.0 * energy * h.powi(2) / mu.powi(2);
+        let e = radicand.max(0.0).sqrt();
+
+        let vsq = vr.powi(2) + vo.powi(2);
+        let a = 1.0 / (2.0 / r - vsq / mu);
+        let q = a * (1.0 - e);
+
+        let cosf = (r * vo.powi(2) / mu - 1.0) / e;
+        let mut true_anomaly = nice_acos(cosf);
 
         let interpolation_bounds = 365.25;
 
@@ -235,6 +259,9 @@ impl InitialCondition {
             cos_inc: inc.cos(),
             sin_latitude_threshold,
             energy,
+            q,
+            e, 
+            true_anomaly,
             r_min,  r_max,
             vr_min, vr_max,
             vo_min, vo_max,
@@ -270,5 +297,17 @@ impl InitialCondition {
     pub fn g_at_epoch(&self, epoch: f64) -> f64 {
         let scaled_dt = (epoch - self.epoch) / self.interpolation_bounds;
         chebyshev_eval(&self.g_poly, scaled_dt)
+    }
+
+
+
+    pub fn to_bounds_key(&self) -> Option<IcBoundsKey> {
+        Some(IcBoundsKey::KEV {
+            r_bounds:   (OrderedFloat(self.r_min?),   OrderedFloat(self.r_max?)),
+            vr_bounds:  (OrderedFloat(self.vr_min?),  OrderedFloat(self.vr_max?)),
+            vo_bounds:  (OrderedFloat(self.vo_min?),  OrderedFloat(self.vo_max?)),
+            psi_bounds: (OrderedFloat(self.inc_min?), OrderedFloat(self.inc_max?)),
+            epoch:      OrderedFloat(self.epoch),
+        })
     }
 }

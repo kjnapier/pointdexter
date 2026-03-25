@@ -44,7 +44,10 @@ pub fn sync_detection_to_orbit(det: &Detection, ic: &InitialCondition) -> Option
     let rho_opt = optimize_rho_v2(det, ic, ic.r - 1.0, 1.0); // Keep in mind that there can be multiple solutions, but not for TNOs.
     let (rho, r) = match rho_opt {
         Some((rho_val, r_val)) => (rho_val, r_val),
-        None => return None,
+        None => {
+            println!("optimize_rho_v2 failed for det {}", det.intid);
+            return None;
+        }
     };
     
     let r_vec = det.observer_position + rho * det.rho_hat;
@@ -66,11 +69,12 @@ pub fn sync_detection_to_orbit(det: &Detection, ic: &InitialCondition) -> Option
     let vr = (vsq - vo * vo).max(0.0).sqrt(); // ensure non-negative argument for sqrt
     
     if (r_vec[2] / r).abs() > ic.sin_latitude_threshold {
+        //println!("Latitude threshold failed for det {}: {} > {}", det.intid, (r_vec[2] / r).abs(), ic.sin_latitude_threshold);
         return None;
     }
 
     let cos_psi = ic.cos_inc / cos_theta;
-    let sin_psi = ic.kappa as f64 * (1.0 - cos_psi * cos_psi).sqrt();
+    let sin_psi = ic.kappa as f64 * (1.0_f64 - cos_psi * cos_psi).sqrt();
 
     let v_vec = vr * r_vec / r + vo * (cos_psi * ahat + sin_psi * dhat);
 

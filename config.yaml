@@ -29,14 +29,14 @@ trajectories_filename: /data/trruch/trajectories/test.json.gz
 
 # Paths to the input files
 #detection_catalog: /data/trruch/detection_catalogs/detections_test_november.csv
-detection_catalog: /data/trruch/catalog_cleaning/data/2016/2016_B05.csv
-all_detections_catalog: /data/trruch/catalog_cleaning/data/2016/2016_B05.csv
+detection_catalog: /data/trruch/catalog_cleaning/des_wide_field/des_wide_field_linking_1.csv
+all_detections_catalog: /data/trruch/catalog_cleaning/des_wide_field/des_wide_field_linking_1.csv
 all_x3_exps_file: /data/trruch/DES_SN-X3_2015_exposure_table.csv
 #initial_conditions: /Users/thomasruch/Gerdes/Grid/rust_grid_dev_optimizations/one_month_trojan_grid_w_bounds.csv
 #initial_conditions: /Users/thomasruch/Desktop/initial_conditions_for_full_pure_clusters.csv
-initial_conditions: /data/trruch/grids/tmax60_r20_1000_eb9_2015.csv # testy.csv is the spherical grid
+initial_conditions: /data/trruch/grids/tmax60_r20_1000_eb9_2015_inc.csv # testy.csv is the spherical grid
 #initial_conditions: /data/trruch/grids/test_grid.csv
-fake_catalog: /data/trruch/fakes/combined_fakes_2016_X3.csv
+fake_catalog: /data/trruch/fakes/combined_fakes_2015_X3.csv
 # Clustering parameters
 epsilon_arcsec: 30.0
 min_detections: 6
@@ -47,16 +47,22 @@ t_max: 60.0
 
 
 # Model parameters
-# eta0: 0.74
-# m50: 23.87
-# sigma: 0.38
-eta0: 0.75
-m50: 23.77
-sigma: 0.40
+eta0: 0.74
+m50: 23.87
+sigma: 0.38
+
+# eta0: 0.75
+# m50: 23.77
+# sigma: 0.40
+
 prob_threshold: 0.001
 
 
 # Bad expnums and CCDs to ignore
-#invalid_expnums: [469168, 472397, 482219, 484541, 488472, 488473, 492442, 498777]
-invalid_expnums: [582923, 593389, 597540, 597541, 597542, 597543, 597544, 597545, 597546, 597547, 597548, 597549, 597550, 606297, 607848, 612984]
+invalid_expnums: [469168, 472397, 482219, 484541, 488472, 488473, 492442, 498777]
+#invalid_expnums: [582923, 593389, 597540, 597541, 597542, 597543, 597544, 597545, 597546, 597547, 597548, 597549, 597550, 606297, 607848, 612984]
 invalid_ccds: [-99, 2, 31, 61]
+
+
+
+non_detection: false

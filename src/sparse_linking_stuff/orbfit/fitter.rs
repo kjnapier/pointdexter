@@ -1,6 +1,6 @@
 use crate::detection::Detection;
 
-use spacerocks::time::Time;
+use spacerocks::Time;
 use spacerocks::SpaceRock;
 use spacerocks::coordinates::{Origin, ReferencePlane};
 
@@ -20,15 +20,15 @@ pub fn residuals(detections: &Vec<&Detection>, theta: &Vec<f64>, epoch: &Time) -
     
     for (idx, detection) in detections.iter().enumerate() {
 
-        if let Err(_) = rock.analytic_propagate(&detection.epoch) {
+        if let Err(_) = rock.analytic_propagate(&Time::new(detection.epoch, "utc", "jd").expect("Failed to create Time for propagation")) {
             return None; // Return None if propagation fails
         }
 
         // rock.analytic_propagate(&detection.epoch);
-        let astro = rock.observe(&detection.observer).unwrap();
+        let astro = rock.observe(detection.observer.as_ref()?).unwrap();
 
-        let ra_residual = (astro.ra() - detection.ra) / detection.ra_ucty;
-        let dec_residual = (astro.dec() - detection.dec) / detection.dec_ucty;
+        let ra_residual = (astro.ra() - detection.ra?) / detection.ra_ucty?;
+        let dec_residual = (astro.dec() - detection.dec?) / detection.dec_ucty?;
 
         residuals[idx] = (ra_residual.powi(2) + dec_residual.powi(2)).sqrt();
     }
@@ -48,13 +48,14 @@ pub fn radec_residuals(detections: &Vec<&Detection>, theta: &Vec<f64>, epoch: &T
     for detection in detections.iter() {
 
         // rock.analytic_propagate(&detection.epoch);
-        if let Err(_) = rock.analytic_propagate(&detection.epoch) {
+        if let Err(_) = rock.analytic_propagate(&Time::new(detection.epoch, "utc", "jd").expect("Failed to create Time for propagation")) {
             return None; // Return None if propagation fails
         }
-        let astro = rock.observe(&detection.observer).unwrap();
+        let astro = rock.observe(detection.observer.as_ref()?).unwrap();
 
-        let ra_residual = (astro.ra() - detection.ra) / detection.ra_ucty;
-        let dec_residual = (astro.dec() - detection.dec) / detection.dec_ucty;
+
+        let ra_residual = (astro.ra() - detection.ra?) / detection.ra_ucty?;
+        let dec_residual = (astro.dec() - detection.dec?) / detection.dec_ucty?;
 
         residuals.push((ra_residual, dec_residual));
     }

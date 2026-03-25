@@ -317,6 +317,7 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
 
         det.ra = Some(ra);
         det.dec = Some(dec);
+        det.set_intid(i);
 
         out.push(det);
     }

@@ -115,8 +115,9 @@ pub static CCD_NUM: Lazy<HashMap<&'static str, i32>> = Lazy::new(|| {
 
 
 const PIXEL_SCALE_RAD: f64 = 0.2637 * PI / (180.0 * 3600.0); // radians per pixel
-const EDGE_MARGIN_DEG: f64 = 50.0 * PIXEL_SCALE_RAD * 180.0 / PI; // 20 pixels in degrees
+const EDGE_MARGIN_DEG: f64 = 20.0 * PIXEL_SCALE_RAD * 180.0 / PI; // 20 pixels in degrees
 
+// If a source falls near a the edge of a ccd, treat it as if it is not on a valid chip
 pub fn compute_chip(rock_ra: f64, rock_dec: f64, exp_ra: f64, exp_dec: f64) -> (String, i32) {
     // ΔRA in degrees, wrapped to (-180, 180], scaled by cos(dec)
     let mut delta_ra = rock_ra - exp_ra;

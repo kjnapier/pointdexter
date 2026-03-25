@@ -1,8 +1,8 @@
 use rayon::prelude::*;
 use std::fmt;
 use crate::sparse_linking_stuff::orbit::{Orbit, find_max_separation_cheat};
-use crate::sparse_linking_stuff::InitialCondition;
-use crate::sparse_linking_stuff::InputFormat;
+use crate::initial_condition::{InitialCondition, InputFormat};
+//use crate::sparse_linking_stuff::InputFormat;
 
 use ordered_float::OrderedFloat;
 use std::collections::HashSet;
@@ -10,8 +10,8 @@ use spacerocks::Time;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::collections::HashMap;
-use crate::sparse_linking_stuff::Detection;
-use crate::sparse_linking_stuff::construct_orbit::{construct_orbit, construct_orbit_from_fake};
+use crate::detection::Detection;
+use crate::sync::sync_detection_to_orbit as construct_orbit;
 use crate::sparse_linking_stuff::trajectory::{Trajectory, angular_separation};
 use spacerocks::SpaceRock;
 
@@ -85,10 +85,10 @@ impl Cell {
     pub fn from_initial_condition(ic: &InitialCondition) -> Option<Self> {
 
         Some(Cell::new([
-            (ic.p1_min?, ic.p1_max?),
-            (ic.p2_min?, ic.p2_max?),
-            (ic.p3_min?, ic.p3_max?),
-            (ic.p4_min?, ic.p4_max?),
+            (ic.r_min?, ic.r_max?),
+            (ic.vr_min?, ic.vr_max?),
+            (ic.vo_min?, ic.vo_max?),
+            (ic.inc_min?, ic.inc_max?),
         ]))
     }
 }
@@ -104,27 +104,50 @@ fn get_orbit(
     t: f64,
     mu: f64,
 ) -> Orbit {
-    let ic = InitialCondition::from_params(
-        0,
-        format,
-        None, None, values[0],
-        None, None, values[1],
-        None, None, values[2],
-        None, None, values[3],
-        Time::new(t, "utc", "jd").unwrap(),
-        mu,
-    );
+    let epoch = Time::new(t, "utc", "jd").unwrap();
 
-    if ic.q.is_nan() || ic.e.is_nan() || ic.true_anomaly.is_nan() {
-        println!("NaN IC from values: {:?}, format: {:?}", values, format);
-    }
+    let ic = match format {
+        InputFormat::KEV => InitialCondition::from_spherical(
+            "temp".to_string(),
+            values[0], // r
+            values[1], // vr
+            values[2], // vo
+            values[3], // inc (used as psi)
+            0,
+            epoch,
+            mu,
+            None, None, None, None, None, None, None, None,
+        ).unwrap(),
+        InputFormat::QEF => InitialCondition::from_elements(
+            "temp".to_string(),
+            values[0], // q
+            values[1], // e
+            values[3], // inc
+            values[2], // true_anomaly
+            0,
+            epoch,
+            mu,
+            None, None, None, None, None, None, None, None,
+        ).unwrap(),
+        InputFormat::KEP => InitialCondition::from_keplerian(
+            "temp".to_string(),
+            values[0], // q
+            values[1], // e
+            values[3], // inc
+            values[2], // mean_anomaly
+            0,
+            epoch,
+            mu,
+            None, None, None, None, None, None, None, None,
+        ).unwrap(),
+    };
 
     Orbit::new(
         "temp".to_string(),
         ic.q,
         ic.e,
         ic.true_anomaly,
-        ic.psi,
+        ic.inc,  // psi in Orbit corresponds to inc in InitialCondition
         t,
         mu,
     )
@@ -282,7 +305,7 @@ fn refine_single_trajectory(
                 t_bounds,
                 original_ic.mu,
                 epsilon,
-                original_ic.format.clone(),
+                InputFormat::KEV, // Assuming KEV format for grid generation; adjust if needed
             );
         }
 
@@ -305,27 +328,23 @@ fn refine_single_trajectory(
 
     for rc in &cells {
         let mid = rc.midpoint();
-        let refined_ic = InitialCondition::from_params(
+        let refined_ic = InitialCondition::from_spherical(
+            "temp".to_string(),
+            mid[0], // r
+            mid[1], // vr
+            mid[2], // vo
+            mid[3], // inc
             0,
-            original_ic.format,
-            Some(rc.bounds[0].0),
-            Some(rc.bounds[0].1),
-            mid[0],
-            Some(rc.bounds[1].0),
-            Some(rc.bounds[1].1),
-            mid[1],
-            Some(rc.bounds[2].0),
-            Some(rc.bounds[2].1),
-            mid[2],
-            Some(rc.bounds[3].0),
-            Some(rc.bounds[3].1),
-            mid[3],
-            original_ic.epoch.clone(),
+            Time::new(original_ic.epoch, "utc", "jd").unwrap(),
             original_ic.mu,
-        );
+            Some(rc.bounds[0].0), Some(rc.bounds[0].1),
+            Some(rc.bounds[1].0), Some(rc.bounds[1].1),
+            Some(rc.bounds[2].0), Some(rc.bounds[2].1),
+            Some(rc.bounds[3].0), Some(rc.bounds[3].1),
+        ).unwrap();
 
         // Propagate the center detection
-        let (center_pt, _) = match construct_orbit(center_det, &refined_ic, Some(false)) {
+        let center_pt = match construct_orbit(center_det, &refined_ic) {
             Some(v) => v,
             None => continue,
         };
@@ -342,7 +361,7 @@ fn refine_single_trajectory(
                 }
             };
 
-            let (pt, _) = match construct_orbit(det, &refined_ic, Some(false)) {
+            let pt = match construct_orbit(det, &refined_ic) {
                 Some(v) => v,
                 None => {
                     all_within = false;

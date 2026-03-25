@@ -2,6 +2,7 @@ use crate::detection::Detection;
 
 use spacerocks::constants::{MU_BARY, SPEED_OF_LIGHT};
 use spacerocks::SpaceRock;
+use spacerocks::Time;
 
 use nalgebra::Matrix3;
 use nalgebra::matrix;
@@ -10,7 +11,7 @@ use nalgebra::matrix;
 
 pub fn gauss_fit(dets: &Vec<&Detection>, min_distance: f64) -> Option<Vec<SpaceRock>> {
     let mut detections = dets.clone();
-    detections.sort_by(|b, a| a.epoch.epoch.partial_cmp(&b.epoch.epoch).unwrap());
+    detections.sort_by(|b, a| a.epoch.partial_cmp(&b.epoch).unwrap());
     let first = &detections[0];
     let last = &detections[detections.len() - 1];
     let middle = &detections[detections.len() / 2];
@@ -21,17 +22,17 @@ pub fn gauss_fit(dets: &Vec<&Detection>, min_distance: f64) -> Option<Vec<SpaceR
 
 pub fn gauss(triplet: &Vec<&Detection>, min_distance: f64) -> Option<Vec<SpaceRock>> {
 
-    let R1 = triplet[0].observer.position;
-    let R2 = triplet[1].observer.position;
-    let R3 = triplet[2].observer.position;
+    let R1 = triplet[0].observer_position;
+    let R2 = triplet[1].observer_position;
+    let R3 = triplet[2].observer_position;
 
     let rho1 = triplet[0].pointing();
     let rho2 = triplet[1].pointing();
     let rho3 = triplet[2].pointing();
     
-    let t1 = triplet[0].epoch.epoch;
-    let t2 = triplet[1].epoch.epoch;
-    let t3 = triplet[2].epoch.epoch;
+    let t1 = triplet[0].epoch;
+    let t2 = triplet[1].epoch;
+    let t3 = triplet[2].epoch;
 
     let tau1 = t1 - t2;
     let tau3 = t3 - t2;
@@ -109,9 +110,9 @@ pub fn gauss(triplet: &Vec<&Detection>, min_distance: f64) -> Option<Vec<SpaceRo
 
         let ltt = r2.norm() / SPEED_OF_LIGHT;
         let mut corrected_t = triplet[1].epoch.clone();
-        corrected_t.epoch -= ltt;
+        corrected_t -= ltt;
         // let rock = SpaceRock::from_state("rock", state, corrected_t, "J2000", "SSB");
-        let rock = SpaceRock::from_xyz("rock", x, y, z, vx, vy, vz, corrected_t, "J2000", "SSB").expect("Failed to create SpaceRock from XYZ");        
+        let rock = SpaceRock::from_xyz("rock", x, y, z, vx, vy, vz, Time::new(corrected_t, "utc", "jd").expect("Failed to create Time"), "J2000", "SSB").expect("Failed to create SpaceRock from XYZ");        
         res.push(rock);
     }
 

@@ -1,5 +1,5 @@
 use crate::sparse_linking_stuff::ccd::compute_chip;
-use crate::sparse_linking_stuff::Detection;
+use crate::detection::Detection;
 use spacerocks::{SpaceRock, Simulation, observing::Observatory};
 use spacerocks::time::Time;
 use spacerocks::SpiceKernel;
@@ -86,11 +86,13 @@ pub fn non_detection_prob_pass(
         if let Some(cands) = dets_by_expnum.get(&exp.expnum) {
             let mut hit = false;
             for d in cands {
-                let dist = angular_distance_deg(d.ra, d.dec, ra_obs, dec_obs);
-                if dist < (5.0 / 3600.0) {
-                    hit = true;
-                    if let Some(m) = d.mag.as_ref().and_then(|s| s.parse::<f64>().ok()) {
-                        matched_mags.push(m);
+                if let (Some(ra), Some(dec)) = (d.ra, d.dec) {
+                    let dist = angular_distance_deg(ra, dec, ra_obs, dec_obs);
+                    if dist < (5.0 / 3600.0) {
+                        hit = true;
+                        if let Some(m) = d.mag {
+                            matched_mags.push(m);
+                        }
                     }
                 }
             }

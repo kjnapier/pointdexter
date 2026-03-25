@@ -1,4 +1,5 @@
-use spacerocks::{Time, Observer};
+use spacerocks::Time;
+use spacerocks::observing::{Observer, Observation};
 use nalgebra::{Vector3, DMatrix, Matrix3};
 
 // equatorial_to_ecliptic_matrix and ecliptic_to_equatorial_matrix can be used for conversions
@@ -58,6 +59,7 @@ pub struct Detection {
     pub observer: Option<Observer>,
     pub ra: Option<f64>,
     pub dec: Option<f64>,
+    pub intid: usize,
 
 }
 
@@ -97,6 +99,7 @@ impl Detection {
             observer: None,
             ra: None, 
             dec: None,
+            intid: 0,
         }
     }
 
@@ -135,18 +138,26 @@ impl Detection {
         Vector3::new(x, y, z)
     }
 
-    pub fn to_observation(&self) -> Observation {
-        let covariance = [[self.ra_ucty.powi(2), 0.0], [0.0, self.dec_ucty.powi(2)]];
-        let mag: Option<f64> = self.mag.clone().and_then(|s| s.parse().ok());
+    pub fn to_observation(&self) -> Option<Observation> {
+        let ra = self.ra?;
+        let dec = self.dec?;
+        let observer = self.observer.clone()?;
+        let epoch = Time::new(self.epoch, "tdb", "jd").ok()?;
+
+        let covariance = match (self.ra_ucty, self.dec_ucty) {
+            (Some(ra_u), Some(dec_u)) => Some([[ra_u.powi(2), 0.0], [0.0, dec_u.powi(2)]]),
+            _ => None,
+        };
+
         Observation::from_astrometry(
-            self.epoch.clone(),
-            self.ra.clone(),
-            self.dec.clone(),
-            self.observer.clone(),
-            Some(covariance),
-            mag,
+            epoch,
+            ra,
+            dec,
+            observer,
+            covariance,
+            self.mag,
             None,
-        ).expect("Failed to create observation from detection")
+        ).ok()
     }
 
     pub fn from_observer(
@@ -227,6 +238,9 @@ impl Detection {
         self.observer = Some(observer);
     }
 
+    pub fn set_intid(&mut self, intid: usize) {
+        self.intid = intid;
+    }
 
 
     // make getters
