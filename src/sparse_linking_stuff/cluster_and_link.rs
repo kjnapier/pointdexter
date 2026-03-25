@@ -69,6 +69,163 @@ use crate::sparse_linking_stuff::pipeline_metrics::PipelineMetrics;
 
 
 
+pub fn run_ic_cluster_and_trajectory_search(
+    ic: &InitialCondition,
+    detections: &[Detection],
+    det_map: &HashMap<u64, Detection>,
+    epsilon_arcsec: f64,
+    config: &Config,
+    pipeline_metrics: &Arc<PipelineMetrics>,
+) -> Vec<Trajectory> {
+
+    let mut valid_trajs = Vec::new();
+    let eps = epsilon_arcsec / ARCSEC_PER_RAD;
+    let cluster_radius = 2.0 * (1.0 - eps.cos());
+
+    let mut point_map: HashMap<u64, [f64; 3]> = HashMap::new();
+    let mut center_list = Vec::new();
+
+    // --- 1: collect all valid points first ---
+    let mut points: Vec<[f64; 3]> = Vec::new();
+    let mut intids: Vec<u64> = Vec::new();
+
+    for det in detections {
+        if let Some(pt) = construct_orbit(det, ic) {
+            if pt.iter().any(|v| !v.is_finite()) {
+                println!("Skipping invalid KD point: {:?} from det {}", pt, det.intid);
+                continue;
+            }
+            points.push(pt);
+            intids.push(det.intid as u64);
+            point_map.insert(det.intid as u64, pt);
+            center_list.push((det.intid as u64, pt));
+        }
+    }
+
+    if points.is_empty() {
+        return valid_trajs;
+    }
+
+    // --- 2: build the immutable tree from the collected points ---
+    type Tree = ImmutableKdTree<f64, u64, 3, 32>;
+    let tree: Tree = ImmutableKdTree::new_from_slice(&points);
+
+    // --- 3: cluster search ---
+    for &(center_id, center_pt) in &center_list {
+        let center_epoch = det_map.get(&center_id).unwrap().epoch;
+        let all_neighbors = tree.within_unsorted::<SquaredEuclidean>(&center_pt, cluster_radius);
+
+        // Find all the neihbors that satisfy our combined spatial and temporal criteria. 
+        // The spatial criteria is a time-dependent cone, where the radius of the cone grows linearly with time from the center detection.
+        // The temporal criteria is just that the detections must be within t_max/2 of the center detection.
+        let neighbors: Vec<_> = all_neighbors
+            .into_iter()
+            .filter(|nb| {
+                let intid = intids[nb.item as usize];
+                let det = det_map.get(&intid).unwrap();
+                let dt = (det.epoch - center_epoch).abs();
+
+                if dt > config.t_max / 2.0 + 1.0 {
+                    return false;
+                }
+
+                let pt2 = *point_map.get(&intid).unwrap();
+                let sep_arcsec = angular_separation(center_pt, pt2)
+                    .iter()
+                    .map(|x| x.powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+
+                if sep_arcsec < 0.1 * config.epsilon_arcsec {
+                    return true;
+                }
+
+                sep_arcsec < config.epsilon_arcsec * dt / (config.t_max / 2.0)
+            })
+            .collect();
+
+        if neighbors.len() < config.min_detections || neighbors.len() > config.max_detections {
+            continue;
+        }
+
+        let mut nights = HashSet::new();
+        for nb in &neighbors {
+            let intid = intids[nb.item as usize];
+            let d = det_map.get(&intid).unwrap();
+            nights.insert(d.nite);
+        }
+
+        if nights.len() < config.min_nites {
+            continue;
+        }
+
+        let mut expnums = HashSet::new();
+        for nb in &neighbors {
+            let intid = intids[nb.item as usize];
+            let d = det_map.get(&intid).unwrap();
+            if let Some(expnum) = d.expnum {
+                expnums.insert(expnum);
+            }
+        }
+
+        if expnums.len() < config.min_detections {
+            continue;
+        }
+
+        let times: Vec<f64> = neighbors.iter()
+            .map(|nb| det_map.get(&intids[nb.item as usize]).unwrap().epoch)
+            .collect();
+        let min_t = *times.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+        let max_t = *times.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+        if (max_t - min_t) < config.min_duration {
+            continue;
+        }
+
+        let cluster_ids: Vec<usize> = neighbors.iter()
+            .map(|nb| intids[nb.item as usize] as usize)
+            .collect();
+        pipeline_metrics.track_cluster(&cluster_ids);
+
+        let raw_vec: Vec<RawDetection> = neighbors
+            .iter()
+            .map(|nb| {
+                let intid = intids[nb.item as usize];
+                let det = det_map.get(&intid).unwrap();
+                let pt2 = *point_map.get(&intid).unwrap();
+                let [dphi, dtheta] = angular_separation(center_pt, pt2);
+                let mag = det.mag.unwrap_or(0.0);
+                RawDetection {
+                    id: intid as usize,
+                    delta_phi: dphi,
+                    delta_theta: dtheta,
+                    epoch: det.epoch,
+                    magnitude: mag,
+                    night: det.nite.unwrap_or(0),
+                    expnum: det.expnum.unwrap_or(0),
+                }
+            })
+            .collect();
+
+        let meta_pts = create_meta_points(&raw_vec, 1.0, 0.2);
+        let trajs = graph_based_trajectory_search(&meta_pts, 0.6, 45., &config);
+
+        for traj in trajs {
+            let ids: Vec<usize> = traj.iter()
+                .flat_map(|mp| mp.original_detections.iter().map(|rd| rd.id))
+                .collect();
+            valid_trajs.push(Trajectory {
+                detection_ids: ids,
+                center_id,
+            });
+        }
+    }
+
+    valid_trajs
+}
+
+
+
+
 /// Function that takes a traj and tries to orbit fit. Also included the non-detection-prob test. If successful, returns a Link object.
 pub fn try_link(
     traj: &Trajectory,
@@ -253,159 +410,4 @@ pub fn try_link(
     }
 
     None
-}
-
-
-pub fn run_ic_cluster_and_trajectory_search(
-    ic: &InitialCondition,
-    detections: &[Detection],
-    det_map: &HashMap<u64, Detection>,
-    epsilon_arcsec: f64,
-    config: &Config,
-    arcsec_per_rad: f64,
-    pipeline_metrics: &Arc<PipelineMetrics>,
-) -> Vec<Trajectory> {
-
-    let mut valid_trajs = Vec::new();
-    let eps = epsilon_arcsec / arcsec_per_rad;
-    let cluster_radius = 2.0 * (1.0 - eps.cos());
-
-    let mut point_map: HashMap<u64, [f64; 3]> = HashMap::new();
-    let mut center_list = Vec::new();
-
-    // --- 1: collect all valid points first ---
-    let mut points: Vec<[f64; 3]> = Vec::new();
-    let mut intids: Vec<u64> = Vec::new();
-
-    for det in detections {
-        if let Some(pt) = construct_orbit(det, ic) {
-            if pt.iter().any(|v| !v.is_finite()) {
-                println!("Skipping invalid KD point: {:?} from det {}", pt, det.intid);
-                continue;
-            }
-            points.push(pt);
-            intids.push(det.intid as u64);
-            point_map.insert(det.intid as u64, pt);
-            center_list.push((det.intid as u64, pt));
-        }
-    }
-
-    if points.is_empty() {
-        return valid_trajs;
-    }
-
-    // --- 2: build the immutable tree from the collected points ---
-    type Tree = ImmutableKdTree<f64, u64, 3, 32>;
-    let tree: Tree = ImmutableKdTree::new_from_slice(&points);
-
-    // --- 3: cluster search ---
-    for &(center_id, center_pt) in &center_list {
-        let center_epoch = det_map.get(&center_id).unwrap().epoch;
-        let all_neighbors = tree.within_unsorted::<SquaredEuclidean>(&center_pt, cluster_radius);
-
-        // Note: ImmutableKdTree returns indices into the points slice, not the intids directly.
-        // So we map back through the intids vec.
-        let neighbors: Vec<_> = all_neighbors
-            .into_iter()
-            .filter(|nb| {
-                let intid = intids[nb.item as usize];
-                let det = det_map.get(&intid).unwrap();
-                let dt = (det.epoch - center_epoch).abs();
-
-                if dt > config.t_max / 2.0 + 1.0 {
-                    return false;
-                }
-
-                let pt2 = *point_map.get(&intid).unwrap();
-                let sep_arcsec = angular_separation(center_pt, pt2)
-                    .iter()
-                    .map(|x| x.powi(2))
-                    .sum::<f64>()
-                    .sqrt();
-
-                if sep_arcsec < 0.1 * config.epsilon_arcsec {
-                    return true;
-                }
-
-                sep_arcsec < config.epsilon_arcsec * dt / (config.t_max / 2.0)
-            })
-            .collect();
-
-        if neighbors.len() < config.min_detections || neighbors.len() > config.max_detections {
-            continue;
-        }
-
-        let mut nights = HashSet::new();
-        for nb in &neighbors {
-            let intid = intids[nb.item as usize];
-            let d = det_map.get(&intid).unwrap();
-            nights.insert(d.nite);
-        }
-
-        if nights.len() < config.min_nites {
-            continue;
-        }
-
-        let mut expnums = HashSet::new();
-        for nb in &neighbors {
-            let intid = intids[nb.item as usize];
-            let d = det_map.get(&intid).unwrap();
-            if let Some(expnum) = d.expnum {
-                expnums.insert(expnum);
-            }
-        }
-
-        if expnums.len() < config.min_detections {
-            continue;
-        }
-
-        let times: Vec<f64> = neighbors.iter()
-            .map(|nb| det_map.get(&intids[nb.item as usize]).unwrap().epoch)
-            .collect();
-        let min_t = *times.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-        let max_t = *times.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-        if (max_t - min_t) < config.min_duration {
-            continue;
-        }
-
-        let cluster_ids: Vec<usize> = neighbors.iter()
-            .map(|nb| intids[nb.item as usize] as usize)
-            .collect();
-        pipeline_metrics.track_cluster(&cluster_ids);
-
-        let raw_vec: Vec<RawDetection> = neighbors
-            .iter()
-            .map(|nb| {
-                let intid = intids[nb.item as usize];
-                let det = det_map.get(&intid).unwrap();
-                let pt2 = *point_map.get(&intid).unwrap();
-                let [dphi, dtheta] = angular_separation(center_pt, pt2);
-                let mag = det.mag.unwrap_or(0.0);
-                RawDetection {
-                    id: intid as usize,
-                    delta_phi: dphi,
-                    delta_theta: dtheta,
-                    epoch: det.epoch,
-                    magnitude: mag,
-                    night: det.nite.unwrap_or(0),
-                    expnum: det.expnum.unwrap_or(0),
-                }
-            })
-            .collect();
-
-        let meta_pts = create_meta_points(&raw_vec, 1.0, 0.2);
-        let trajs = graph_based_trajectory_search(&meta_pts, 0.6, 45., &config);
-
-        for traj in trajs {
-            let ids: Vec<usize> = traj.iter()
-                .flat_map(|mp| mp.original_detections.iter().map(|rd| rd.id))
-                .collect();
-            valid_trajs.push(Trajectory {
-                detection_ids: ids,
-                center_id,
-            });
-        }
-    }
-
-    valid_trajs
 }

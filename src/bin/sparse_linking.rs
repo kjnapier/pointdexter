@@ -96,10 +96,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ic_path = config.initial_conditions.clone();
     let det_path = config.detection_catalog.clone();
-    let tref = 2457249.0; // This is just a reference epoch for the initial conditions,
-
+    
     // Read in my catalogs
-    let ics: Vec<InitialCondition> = pointdexter::io::load_ics::load_initial_conditions(&ic_path, "spherical", "SSB", tref)?;
+    let ics: Vec<InitialCondition> = pointdexter::io::load_ics::load_initial_conditions(&ic_path, "spherical", "SSB", config.t_ref)?;
     let detections: Vec<Detection> = pointdexter::io::load_detections::load_detections(&det_path, &"J2000", &kernel)?;
     let all_x3_exps: Vec<ExposureRow> = pointdexter::sparse_linking_stuff::io::read_exposure_metadata(&config.all_x3_exps_file)?;
 
@@ -117,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut final_links = HashSet::new();
     let mut all_saved_trajectories = Vec::new(); // Store all saved trajectories
 
-    let batch_size = 10; // Size of this can be adjusted based on memory and performance, just don't want to have too many trajectories in memory at once
+    let batch_size = config.batch_size; // Size of this can be adjusted based on memory and performance, just don't want to have too many trajectories in memory at once
     let num_batches = (ics.len() + batch_size - 1) / batch_size;
     println!("Processing {} batches of size {}", num_batches, batch_size);
 
@@ -130,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Iterate over initial conditions in parallel, collecting trajectories
         ic_batch.par_iter().progress_count(ic_batch.len() as u64).for_each(|ic| {
             let mut valid_trajs = run_ic_cluster_and_trajectory_search(
-                ic, &detections, &det_map, config.epsilon_arcsec, &config, ARCSEC_PER_RAD, &pipeline_metrics,
+                ic, &detections, &det_map, config.epsilon_arcsec, &config, &pipeline_metrics,
             );
 
             for traj in valid_trajs.drain(..) {

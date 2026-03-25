@@ -32,4 +32,6 @@ pub struct Config {
     pub sigma: f64,
     pub prob_threshold: f64,
     pub non_detection: bool,
+    pub t_ref: f64,
+    pub batch_size: usize,
 }
