@@ -92,11 +92,21 @@ pub fn read_initial_conditions_kep(
     let df = read_csv(path)?;
     let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
 
-    let q = df.column("q")?.as_series().unwrap().f64()?;
-    let e = df.column("e")?.as_series().unwrap().f64()?;
-    let inc = df.column("inc")?.as_series().unwrap().f64()?;
-    let m0 = df.column("M0")?.as_series().unwrap().f64()?;
-    let kappa = df.column("kappa")?.as_series().unwrap().f64()?; // keep as f64 then cast per-row
+    let q     = df.column("q")?.as_series().unwrap().f64()?;
+    let e     = df.column("e")?.as_series().unwrap().f64()?;
+    let inc   = df.column("inc")?.as_series().unwrap().f64()?;
+    let m0    = df.column("M0")?.as_series().unwrap().f64()?;
+    let kappa = df.column("kappa")?.as_series().unwrap().f64()?;
+
+    // optional bound columns
+    let r_min   = df.column("r_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let r_max   = df.column("r_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vr_min  = df.column("vr_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vr_max  = df.column("vr_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vo_min  = df.column("vo_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vo_max  = df.column("vo_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let inc_min = df.column("inc_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let inc_max = df.column("inc_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
 
     let mut ics = Vec::with_capacity(df.height());
     for row in 0..df.height() {
@@ -108,11 +118,17 @@ pub fn read_initial_conditions_kep(
             e.get(row).ok_or_else(|| format!("Row {row}: 'e' is null"))?,
             inc.get(row).ok_or_else(|| format!("Row {row}: 'inc' is null"))?,
             m0.get(row).ok_or_else(|| format!("Row {row}: 'M0' is null"))?,
-            kappa
-                .get(row)
-                .ok_or_else(|| format!("Row {row}: 'kappa' is null"))? as i32,
+            kappa.get(row).ok_or_else(|| format!("Row {row}: 'kappa' is null"))? as i32,
             epoch.clone(),
             mu,
+            r_min.as_ref().and_then(|c| c.get(row)),
+            r_max.as_ref().and_then(|c| c.get(row)),
+            vr_min.as_ref().and_then(|c| c.get(row)),
+            vr_max.as_ref().and_then(|c| c.get(row)),
+            vo_min.as_ref().and_then(|c| c.get(row)),
+            vo_max.as_ref().and_then(|c| c.get(row)),
+            inc_min.as_ref().and_then(|c| c.get(row)),
+            inc_max.as_ref().and_then(|c| c.get(row)),
         )?;
         ics.push(ic);
     }
@@ -127,11 +143,21 @@ pub fn read_initial_conditions_sph(
     let df = read_csv(path)?;
     let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
 
-    let r = df.column("r")?.as_series().unwrap().f64()?;
-    let vr = df.column("vr")?.as_series().unwrap().f64()?;
-    let vo = df.column("vo")?.as_series().unwrap().f64()?;
-    let inc = df.column("inc")?.as_series().unwrap().f64()?;
+    let r     = df.column("r")?.as_series().unwrap().f64()?;
+    let vr    = df.column("vr")?.as_series().unwrap().f64()?;
+    let vo    = df.column("vo")?.as_series().unwrap().f64()?;
+    let inc   = df.column("inc")?.as_series().unwrap().f64()?;
     let kappa = df.column("kappa")?.as_series().unwrap().f64()?;
+
+    // optional bound columns
+    let r_min   = df.column("r_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let r_max   = df.column("r_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vr_min  = df.column("vr_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vr_max  = df.column("vr_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vo_min  = df.column("vo_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let vo_max  = df.column("vo_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let inc_min = df.column("inc_min").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
+    let inc_max = df.column("inc_max").ok().and_then(|c| c.as_series()?.f64().ok().cloned());
 
     let mut ics = Vec::with_capacity(df.height());
     for row in 0..df.height() {
@@ -143,47 +169,19 @@ pub fn read_initial_conditions_sph(
             vr.get(row).ok_or_else(|| format!("Row {row}: 'vr' is null"))?,
             vo.get(row).ok_or_else(|| format!("Row {row}: 'vo' is null"))?,
             inc.get(row).ok_or_else(|| format!("Row {row}: 'inc' is null"))?,
-            kappa
-                .get(row)
-                .ok_or_else(|| format!("Row {row}: 'kappa' is null"))? as i32,
+            kappa.get(row).ok_or_else(|| format!("Row {row}: 'kappa' is null"))? as i32,
             epoch.clone(),
             mu,
+            r_min.as_ref().and_then(|c| c.get(row)),
+            r_max.as_ref().and_then(|c| c.get(row)),
+            vr_min.as_ref().and_then(|c| c.get(row)),
+            vr_max.as_ref().and_then(|c| c.get(row)),
+            vo_min.as_ref().and_then(|c| c.get(row)),
+            vo_max.as_ref().and_then(|c| c.get(row)),
+            inc_min.as_ref().and_then(|c| c.get(row)),
+            inc_max.as_ref().and_then(|c| c.get(row)),
         )?;
         ics.push(ic);
     }
     Ok(ics)
-}
-
-pub fn read_initial_conditions_3d(path: &str, mu: f64, reference_epoch_jd: f64) -> Result<Vec<InitialCondition3D>, Box<dyn std::error::Error>> {
-    let df = read_csv(path)?;
-    let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
-
-    let r = df.column("r")?.as_series().unwrap().f64()?;
-    let vr = df.column("vr")?.as_series().unwrap().f64()?;
-    let vo = df.column("vo")?.as_series().unwrap().f64()?;
-
-    let mut ics = Vec::with_capacity(df.height());
-    for row in 0..df.height() {
-        let id = read_id(&df, row)?;
-
-        let ic = InitialCondition3D::from_spherical(
-            id,
-            r.get(row).ok_or_else(|| format!("Row {row}: 'r' is null"))?,
-            vr.get(row).ok_or_else(|| format!("Row {row}: 'vr' is null"))?,
-            vo.get(row).ok_or_else(|| format!("Row {row}: 'vo' is null"))?,
-            epoch.clone(),
-            mu,
-        )?;
-        ics.push(ic);
-    }
-    Ok(ics)
-}
-
-
-
-pub fn load_initial_conditions3d(path: &str, origin: &str, reference_epoch_jd: f64) -> Result<Vec<InitialCondition3D>, Box<dyn std::error::Error>> {
-    let spacerock_origin = Origin::from_str(origin)?;
-    let mu = spacerock_origin.mu();
-
-    read_initial_conditions_3d(path, mu, reference_epoch_jd)
 }

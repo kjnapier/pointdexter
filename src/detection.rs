@@ -52,6 +52,13 @@ pub struct Detection {
     pub rho_hat_dot_observer_position: f64,
     pub observer_distance_squared: f64,
 
+    // New additions 
+    pub expnum: Option<i64>,
+    pub nite: Option<i64>,
+    pub observer: Option<Observer>,
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
+
 }
 
 impl Detection {
@@ -85,6 +92,11 @@ impl Detection {
             obscode: None,
             rho_hat_dot_observer_position: rho_hat_dot_observer_position,
             observer_distance_squared: observer_distance_squared,
+            expnum: None,
+            nite: None,
+            observer: None,
+            ra: None, 
+            dec: None,
         }
     }
 
@@ -115,6 +127,44 @@ impl Detection {
         }
        self.reference_plane = ReferencePlane::Ecliptic;
     }
+
+    pub fn pointing(&self) -> Vector3<f64> {
+        let x = self.ra.unwrap_or(0.0).cos() * self.dec.unwrap_or(0.0).cos();
+        let y = self.ra.unwrap_or(0.0).sin() * self.dec.unwrap_or(0.0).cos();
+        let z = self.dec.unwrap_or(0.0).sin();
+        Vector3::new(x, y, z)
+    }
+
+    pub fn to_observation(&self) -> Observation {
+        let covariance = [[self.ra_ucty.powi(2), 0.0], [0.0, self.dec_ucty.powi(2)]];
+        let mag: Option<f64> = self.mag.clone().and_then(|s| s.parse().ok());
+        Observation::from_astrometry(
+            self.epoch.clone(),
+            self.ra.clone(),
+            self.dec.clone(),
+            self.observer.clone(),
+            Some(covariance),
+            mag,
+            None,
+        ).expect("Failed to create observation from detection")
+    }
+
+    pub fn from_observer(
+        ra: f64,
+        dec: f64,
+        epoch: Time,
+        observer: Observer,
+    ) -> Self {
+        let mut det = Self::new(ra, dec, epoch, observer.position);
+        det.observer = Some(observer);
+        det
+    }
+
+
+
+
+
+
 
     pub fn set_observer_position(&mut self, position: Vector3<f64>) {
         self.observer_position = position;
@@ -157,6 +207,28 @@ impl Detection {
         self.filter = Some(filter);
     }
 
+    pub fn set_ra(&mut self, ra: f64) {
+        self.ra = Some(ra);
+    }
+
+    pub fn set_dec(&mut self, dec: f64) {
+        self.dec = Some(dec);
+    }
+
+    pub fn set_expnum(&mut self, expnum: i64) {
+        self.expnum = Some(expnum);
+    }
+
+    pub fn set_nite(&mut self, nite: i64) {
+        self.nite = Some(nite);
+    }
+
+    pub fn set_observer(&mut self, observer: Observer) {
+        self.observer = Some(observer);
+    }
+
+
+
     // make getters
     pub fn rho_hat(&self) -> &Vector3<f64> {
         &self.rho_hat
@@ -193,5 +265,25 @@ impl Detection {
     }
     pub fn dec_ucty(&self) -> &Option<f64> {
         &self.dec_ucty
+    }
+
+    pub fn ra(&self) -> Option<f64> {
+        self.ra
+    }
+
+    pub fn dec(&self) -> Option<f64> {
+        self.dec
+    }
+
+    pub fn expnum(&self) -> Option<i64> {
+        self.expnum
+    }
+
+    pub fn nite(&self) -> Option<i64> {
+        self.nite
+    }
+
+    pub fn observer(&self) -> Option<&Observer> {
+        self.observer.as_ref()
     }
 }

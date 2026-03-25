@@ -27,3 +27,5 @@ pub mod hpix;
 
 pub mod exposure;
     pub use exposure::*;
+
+pub mod sparse_linking_stuff;

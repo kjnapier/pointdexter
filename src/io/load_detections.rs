@@ -45,6 +45,13 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
         Ok(Some(col_series(df, name)?.f64()?))
     }
 
+    fn opt_i64<'a>(df: &'a DataFrame, name: &str) -> PolarsResult<Option<&'a Int64Chunked>> {
+        if !has_col(df, name) {
+            return Ok(None);
+        }
+        Ok(Some(col_series(df, name)?.i64()?))
+    }
+
     enum StringCol<'a> {
         Utf8(&'a StringChunked),
         U8(&'a UInt8Chunked),
@@ -201,6 +208,9 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
     let mag_ucty = opt_f64(&df, "mag_ucty")?;
     let filter = opt_string_like(&df, "filter")?;
 
+    let expnum = opt_i64(&df, "expnum")?;
+    let nite   = opt_i64(&df, "nite")?;
+
     // detid could come in as a string or an int, so we'll just treat it as a string either way.
     let detid = opt_string_like(&df, "detid")?;
     // get the type of the detid column if it exists, and convert to StringCol
@@ -223,48 +233,25 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
         // 1) if obscode present on that row -> use it
         // 2) else if obs_x/y/z all present on that row -> use xyz
         // 3) else error
-        let observer_position = if let Some(col) = &obscode {
+        let mut det = if let Some(col) = &obscode {
             if let Some(code) = col.get(i) {
-                // TODO: replace with real obscode -> (x,y,z) lookup
-                // let _ = code;
-                // Vector3::new(0.0, 0.0, 0.0)
                 let observatory = obscode_map.get(&code).ok_or_else(|| {
                     format!("Row {i}: obscode '{code}' not found in obscode map.")
                 })?;
                 let observer = observatory.at(&epoch, "J2000", "ssb", &kernel)?;
-                observer.position
+                Detection::from_observer(ra, dec, epoch.clone(), observer)
             } else {
-                match (
-                    obs_x.and_then(|c| c.get(i)),
-                    obs_y.and_then(|c| c.get(i)),
-                    obs_z.and_then(|c| c.get(i)),
-                ) {
-                    (Some(x), Some(y), Some(z)) => Vector3::new(x, y, z),
-                    _ => {
-                        return Err(format!(
-                            "Row {i}: need either non-null 'obscode' or non-null 'obs_x','obs_y','obs_z'."
-                        )
-                        .into())
-                    }
+                match (obs_x.and_then(|c| c.get(i)), obs_y.and_then(|c| c.get(i)), obs_z.and_then(|c| c.get(i))) {
+                    (Some(x), Some(y), Some(z)) => Detection::new(ra, dec, epoch.clone(), Vector3::new(x, y, z)),
+                    _ => return Err(format!("Row {i}: need either non-null 'obscode' or non-null 'obs_x','obs_y','obs_z'.").into()),
                 }
             }
         } else {
-            match (
-                obs_x.and_then(|c| c.get(i)),
-                obs_y.and_then(|c| c.get(i)),
-                obs_z.and_then(|c| c.get(i)),
-            ) {
-                (Some(x), Some(y), Some(z)) => Vector3::new(x, y, z),
-                _ => {
-                    return Err(format!(
-                        "Row {i}: missing observer position; no 'obscode' column and xyz not all present."
-                    )
-                    .into())
-                }
+            match (obs_x.and_then(|c| c.get(i)), obs_y.and_then(|c| c.get(i)), obs_z.and_then(|c| c.get(i))) {
+                (Some(x), Some(y), Some(z)) => Detection::new(ra, dec, epoch.clone(), Vector3::new(x, y, z)),
+                _ => return Err(format!("Row {i}: missing observer position; no 'obscode' column and xyz not all present.").into()),
             }
         };
-
-        let mut det = Detection::new(ra, dec, epoch, observer_position);
 
         // velocity: only set if all 3 columns exist AND all 3 values present on this row
         if has_v_cols {
@@ -313,11 +300,23 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
             det.dec_ucty = col.get(i);
         }
 
+        if let Some(col) = &expnum {
+            det.expnum = col.get(i);
+        }
+
+        if let Some(col) = &nite {
+            det.nite = col.get(i);
+        }
+
+
         if reference_plane.to_lowercase() == "ecliptic" {
             det.to_ecliptic();
         } else {
             det.to_equatorial();
         }
+
+        det.ra = Some(ra);
+        det.dec = Some(dec);
 
         out.push(det);
     }
