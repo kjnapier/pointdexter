@@ -11,6 +11,10 @@ pub const EQUATORIAL_TO_ECLIPTIC: Matrix3<f64> = Matrix3::new(1.0, 0.0, 0.0,
 pub const ECLIPTIC_TO_EQUATORIAL: Matrix3<f64> = Matrix3::new(1.0, 0.0, 0.0,
                                                               0.0, 0.917_482_062_069_181_8, -0.397_777_155_931_913_7,
                                                               0.0, 0.397_777_155_931_913_7, 0.917_482_062_069_181_8);
+
+pub const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / std::f64::consts::PI;
+
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReferencePlane {
     Ecliptic,
@@ -144,7 +148,10 @@ impl Detection {
         let observer = self.observer.clone()?;
         let epoch = Time::new(self.epoch, "tdb", "jd").ok()?;
 
-        let covariance = match (self.ra_ucty, self.dec_ucty) {
+        let ra_ucty = Some(0.15 / ARCSEC_PER_RAD);
+        let dec_ucty = Some(0.15 / ARCSEC_PER_RAD);
+
+        let covariance = match (ra_ucty, dec_ucty) {
             (Some(ra_u), Some(dec_u)) => Some([[ra_u.powi(2), 0.0], [0.0, dec_u.powi(2)]]),
             _ => None,
         };

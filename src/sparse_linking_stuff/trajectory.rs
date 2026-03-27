@@ -230,11 +230,11 @@ pub fn is_valid_trajectory(traj: &[MetaPoint], config: &Config,) -> bool {
     let support_count = detection_counts.iter().filter(|&&d| d > 1).count();
 
     // Require at least one metapoint with >= 2 detections. We can remove this.
-    let has_tracklet = detection_counts.iter().any(|&d| d >= 2);
+    // let has_tracklet = detection_counts.iter().any(|&d| d >= 2);
 
     let valid = total_detections >= config.min_detections 
         && unique_nights >= config.min_nites 
-        && has_tracklet 
+        // && has_tracklet 
         && duration >= config.min_duration
         && unique_expnums >= config.min_detections;
     let not_lopsided = !(has_heavy && support_count <= 1);

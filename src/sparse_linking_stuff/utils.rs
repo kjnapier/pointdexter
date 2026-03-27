@@ -2,6 +2,11 @@ use rand::seq::IndexedRandom;
 use rand::rng;
 use std::collections::HashMap;
 use nalgebra::{DMatrix, DVector};
+use polars::prelude::*;
+//use polars::prelude::CsvReadOptions;
+
+use std::fs::File;
+use csv::ReaderBuilder;
 
 use crate::initial_condition::InitialCondition;
 use crate::detection::Detection;
@@ -77,7 +82,7 @@ pub fn residuals(detections: &Vec<&Detection>, rock: &mut SpaceRock, kernel: &Sp
           
 
         // Get the rock to the epoch of the detection
-        sim.integrate(&Time::new(detection.epoch, "utc", "jd")?);
+        sim.integrate(&Time::new(detection.epoch, "tdb", "jd")?);
         let mut rock = sim.get_particle("rock")?.clone();
 
         // calculate the model observations
@@ -117,4 +122,41 @@ pub fn angular_separation(ref_vec: [f64; 3], vec: [f64; 3]) -> [f64; 2] {
     dphi *= theta0.cos();
     let dtheta = (theta1 - theta0) * RADS_TO_ARCSEC;
     [dphi, dtheta]
+}
+
+#[derive(Debug, Clone)]
+pub struct ExposureRow {
+    pub expnum: i64,
+    pub radeg: f64,
+    pub decdeg: f64,
+    pub epoch: f64,
+}
+
+pub fn read_exposure_metadata(path: &str) -> Result<Vec<ExposureRow>, Box<dyn std::error::Error>> {
+    let df = CsvReadOptions::default()
+        .with_infer_schema_length(Some(100))
+        .with_has_header(true)
+        .try_into_reader_with_file_path(Some(path.into()))?
+        .finish()?;
+
+    let expnums: Vec<i64> = df["EXPNUM"]
+        .i64()?
+        .into_no_null_iter()
+        .map(|x| x as i64)
+        .collect();
+    let radeg: Vec<f64> = df["RADEG"].f64()?.into_no_null_iter().collect();
+    let decdeg: Vec<f64> = df["DECDEG"].f64()?.into_no_null_iter().collect();
+    let epoch: Vec<f64> = df["EPOCH"].f64()?.into_no_null_iter().collect();
+
+    let mut exposures = Vec::with_capacity(df.height());
+    for i in 0..df.height() {
+        exposures.push(ExposureRow {
+            expnum: expnums[i],
+            radeg: radeg[i],
+            decdeg: decdeg[i],
+            epoch: epoch[i],
+        });
+    }
+
+    Ok(exposures)
 }

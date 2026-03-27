@@ -1,9 +1,9 @@
 pub mod detection;
     pub use detection::Detection;
 
-pub mod initial_condition;
-    pub use initial_condition::InitialCondition;
-    pub use initial_condition::InputFormat;
+// pub mod initial_condition;
+//     pub use initial_condition::InitialCondition;
+//     pub use initial_condition::InputFormat;
 
 // pub mod initial_condition_psi;
 //     pub use initial_condition_psi::InitialConditionPsi;

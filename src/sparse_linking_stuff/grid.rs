@@ -1,8 +1,7 @@
 use rayon::prelude::*;
 use std::fmt;
 use crate::sparse_linking_stuff::orbit::{Orbit, find_max_separation_cheat};
-use crate::initial_condition::{InitialCondition, InputFormat};
-//use crate::sparse_linking_stuff::InputFormat;
+use crate::initial_condition::{InitialCondition, InputFormat, ElementBounds};
 
 use ordered_float::OrderedFloat;
 use std::collections::HashSet;
@@ -27,25 +26,18 @@ pub struct GridCacheKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IcBoundsKey {
-    QEF {
+    KEP {
         q_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
         e_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
         f_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
-        psi_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
-        epoch: OrderedFloat<f64>,
-    },
-    KEP {
-        a_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
-        e_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
-        f_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
-        psi_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
+        inc_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
         epoch: OrderedFloat<f64>,
     },
     KEV {
         r_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
         vr_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
         vo_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
-        psi_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
+        inc_bounds: (OrderedFloat<f64>, OrderedFloat<f64>),
         epoch: OrderedFloat<f64>,
     },
 }
@@ -82,14 +74,13 @@ impl Cell {
         (Cell::new(bounds_1), Cell::new(bounds_2))
     }
 
-
     pub fn from_initial_condition(ic: &InitialCondition) -> Option<Self> {
-
+        let b = ic.bounds.as_ref()?;
         Some(Cell::new([
-            (ic.r_min?, ic.r_max?),
-            (ic.vr_min?, ic.vr_max?),
-            (ic.vo_min?, ic.vo_max?),
-            (ic.inc_min?, ic.inc_max?),
+            (b.get(0).0?, b.get(0).1?),
+            (b.get(1).0?, b.get(1).1?),
+            (b.get(2).0?, b.get(2).1?),
+            (b.get(3).0?, b.get(3).1?),
         ]))
     }
 }
@@ -99,12 +90,8 @@ impl fmt::Display for Cell {
         write!(f, "{:?}", self.bounds)
     }
 }
-fn get_orbit(
-    values: &[f64; 4],
-    format: InputFormat,
-    t: f64,
-    mu: f64,
-) -> Orbit {
+
+fn get_orbit(values: &[f64; 4], format: InputFormat, t: f64, mu: f64, kappa: i32) -> Orbit {
     let epoch = Time::new(t, "utc", "jd").unwrap();
 
     let ic = match format {
@@ -113,52 +100,33 @@ fn get_orbit(
             values[0], // r
             values[1], // vr
             values[2], // vo
-            values[3], // inc (used as psi)
-            0,
+            values[3], // inc
+            kappa,
             epoch,
             mu,
-            None, None, None, None, None, None, None, None,
+            None,
         ).unwrap(),
-        InputFormat::QEF => InitialCondition::from_elements(
+        InputFormat::KEP => InitialCondition::from_elements(
             "temp".to_string(),
             values[0], // q
             values[1], // e
             values[3], // inc
             values[2], // true_anomaly
-            0,
+            kappa,
             epoch,
             mu,
-            None, None, None, None, None, None, None, None,
-        ).unwrap(),
-        InputFormat::KEP => InitialCondition::from_keplerian(
-            "temp".to_string(),
-            values[0], // q
-            values[1], // e
-            values[3], // inc
-            values[2], // mean_anomaly
-            0,
-            epoch,
-            mu,
-            None, None, None, None, None, None, None, None,
+            None,
         ).unwrap(),
     };
 
-    Orbit::new(
-        "temp".to_string(),
-        ic.q,
-        ic.e,
-        ic.true_anomaly,
-        ic.inc,  // psi in Orbit corresponds to inc in InitialCondition
-        t,
-        mu,
-    )
+    Orbit::new("temp".to_string(), ic.q, ic.e, ic.true_anomaly, ic.inc, t, mu)
 }
 
 fn get_separation(o1: &Orbit, o2: &Orbit, t_bounds: (f64, f64)) -> f64 {
     find_max_separation_cheat(o1, o2, t_bounds) * ARCSEC_PER_RAD
 }
 
-pub fn calculate_axis_separation(cell: &Cell, axis: usize, t: f64, t_bounds: (f64, f64), mu: f64, format: InputFormat) -> f64 {
+pub fn calculate_axis_separation(cell: &Cell, axis: usize, t: f64, t_bounds: (f64, f64), mu: f64, format: InputFormat, kappa: i32) -> f64 {
     let combos = vec![
         vec![0, 0, 0], vec![0, 0, 1], vec![0, 1, 0], vec![0, 1, 1],
         vec![1, 0, 0], vec![1, 0, 1], vec![1, 1, 0], vec![1, 1, 1]
@@ -177,9 +145,7 @@ pub fn calculate_axis_separation(cell: &Cell, axis: usize, t: f64, t_bounds: (f6
                     values[ax] = if idx == 0 { bound.0 } else { bound.1 };
                 }
                 values[axis] = v;
-                // orbits.push(get_orbit(values[0], values[1], values[2], values[3], t, mu));
-                orbits.push(get_orbit(&values, format, t, mu));
-
+                orbits.push(get_orbit(&values, format, t, mu, kappa));
             }
             get_separation(&orbits[0], &orbits[1], t_bounds)
         })
@@ -187,15 +153,13 @@ pub fn calculate_axis_separation(cell: &Cell, axis: usize, t: f64, t_bounds: (f6
         .unwrap_or(0.0)
 }
 
-fn split_cell(cell: &Cell, t: f64, t_bounds: (f64, f64), mu: f64, epsilon: f64, format: InputFormat) -> Option<Vec<Cell>> {
-
+fn split_cell(cell: &Cell, t: f64, t_bounds: (f64, f64), mu: f64, epsilon: f64, format: InputFormat, kappa: i32) -> Option<Vec<Cell>> {
     let mut max_separation = 0.0;
     let mut max_separation_axis = 0;
     let mut should_split = false;
 
     for axis in 0..4 {
-
-        let separation = calculate_axis_separation(cell, axis, t, t_bounds, mu, format);
+        let separation = calculate_axis_separation(cell, axis, t, t_bounds, mu, format, kappa);
 
         if separation > epsilon {
             should_split = true;
@@ -220,12 +184,13 @@ pub fn process_cells_parallel(
     t_bounds: (f64, f64),
     mu: f64,
     epsilon: f64,
-    format: InputFormat, // NEW
+    format: InputFormat,
+    kappa: i32,
 ) -> Vec<Cell> {
     cells
         .into_par_iter()
         .flat_map(|cell| {
-            split_cell(&cell, t, t_bounds, mu, epsilon, format)
+            split_cell(&cell, t, t_bounds, mu, epsilon, format, kappa)
                 .unwrap_or_else(|| vec![cell])
         })
         .collect()
@@ -237,9 +202,9 @@ pub fn generate_adaptive_grid(
     t_bounds: (f64, f64),
     epsilon: f64,
     epoch: Time,
-    format: InputFormat, // NEW
+    format: InputFormat,
+    kappa: i32,
 ) -> Vec<Cell> {
-
     let epoch_val = epoch.epoch;
     let initial_cell = Cell::new(initial_bounds);
     let mut cells = vec![initial_cell];
@@ -251,18 +216,15 @@ pub fn generate_adaptive_grid(
         prev_len = cells.len();
         cells = cells
             .into_par_iter()
-            .flat_map(|c| split_cell(&c, epoch_val, t_bounds, mu, epsilon, format).unwrap_or_else(|| vec![c]))
+            .flat_map(|c| split_cell(&c, epoch_val, t_bounds, mu, epsilon, format, kappa).unwrap_or_else(|| vec![c]))
             .collect();
     }
 
     cells
 }
 
-
-/// Keep n pairs
-
-
 use std::cmp::Ordering;
+
 fn refine_single_trajectory(
     traj: &Trajectory,
     original_ic: &InitialCondition,
@@ -272,6 +234,13 @@ fn refine_single_trajectory(
     t_bounds: (f64, f64),
     max_keep: usize,
 ) -> Vec<(Trajectory, InitialCondition)> {
+
+    let format = original_ic.bounds
+        .as_ref()
+        .map(|b| b.format)
+        .unwrap_or(InputFormat::KEV);
+
+    let kappa = original_ic.kappa;
     let t = (t_bounds.0 + t_bounds.1) / 2.0;
 
     let ic_key = match original_ic.to_bounds_key() {
@@ -283,7 +252,6 @@ fn refine_single_trajectory(
         epsilon: OrderedFloat(epsilon),
     };
 
-    // Try to read from cache without holding the lock for long
     let maybe_cells = {
         let cache = grid_cache.lock().unwrap();
         cache.get(&grid_key).cloned()
@@ -292,7 +260,6 @@ fn refine_single_trajectory(
     let cells = if let Some(cells) = maybe_cells {
         cells
     } else {
-       
         let mut computed = vec![match Cell::from_initial_condition(original_ic) {
             Some(cell) => cell,
             None => return Vec::new(),
@@ -306,11 +273,11 @@ fn refine_single_trajectory(
                 t_bounds,
                 original_ic.mu,
                 epsilon,
-                InputFormat::KEV, // Assuming KEV format for grid generation; adjust if needed
+                format,
+                kappa,
             );
         }
 
-        // Insert into cache
         {
             let mut cache = grid_cache.lock().unwrap();
             cache.insert(grid_key.clone(), computed.clone());
@@ -327,24 +294,59 @@ fn refine_single_trajectory(
 
     let mut candidates: Vec<(f64, InitialCondition)> = Vec::new();
 
+    // // Print initial separations for original IC
+    // println!("Trajectory ic_id: {}", original_ic.id);
+    // if let Some(center_pt_orig) = construct_orbit(center_det, original_ic) {
+    //     for &id in ids {
+    //         if let Some(det) = det_map.get(&(id as u64)) {
+    //             if let Some(pt) = construct_orbit(det, original_ic) {
+    //                 let [dphi, dtheta] = angular_separation(center_pt_orig, pt);
+    //                 let sep = (dphi * dphi + dtheta * dtheta).sqrt();
+    //                 println!("  det {}: sep={:.2} arcsec", id, sep);
+    //             } else {
+    //                 println!("  det {}: construct_orbit returned None", id);
+    //             }
+    //         }
+    //     }
+    // }
+
     for rc in &cells {
         let mid = rc.midpoint();
-        let refined_ic = InitialCondition::from_spherical(
-            "temp".to_string(),
-            mid[0], // r
-            mid[1], // vr
-            mid[2], // vo
-            mid[3], // inc
-            0,
-            Time::new(original_ic.epoch, "utc", "jd").unwrap(),
-            original_ic.mu,
-            Some(rc.bounds[0].0), Some(rc.bounds[0].1),
-            Some(rc.bounds[1].0), Some(rc.bounds[1].1),
-            Some(rc.bounds[2].0), Some(rc.bounds[2].1),
-            Some(rc.bounds[3].0), Some(rc.bounds[3].1),
-        ).unwrap();
+        let refined_ic = match format {
+            InputFormat::KEV => InitialCondition::from_spherical(
+                "temp".to_string(),
+                mid[0], // r
+                mid[1], // vr
+                mid[2], // vo
+                mid[3], // inc
+                kappa,
+                Time::new(original_ic.epoch, "utc", "jd").unwrap(),
+                original_ic.mu,
+                Some(ElementBounds::kev(
+                    (Some(rc.bounds[0].0), Some(rc.bounds[0].1)),
+                    (Some(rc.bounds[1].0), Some(rc.bounds[1].1)),
+                    (Some(rc.bounds[2].0), Some(rc.bounds[2].1)),
+                    (Some(rc.bounds[3].0), Some(rc.bounds[3].1)),
+                )),
+            ).unwrap(),
+            InputFormat::KEP => InitialCondition::from_elements(
+                "temp".to_string(),
+                mid[0], // q
+                mid[1], // e
+                mid[3], // inc
+                mid[2], // true_anomaly
+                kappa,
+                Time::new(original_ic.epoch, "utc", "jd").unwrap(),
+                original_ic.mu,
+                Some(ElementBounds::kep(
+                    (Some(rc.bounds[0].0), Some(rc.bounds[0].1)),
+                    (Some(rc.bounds[1].0), Some(rc.bounds[1].1)),
+                    (Some(rc.bounds[2].0), Some(rc.bounds[2].1)),
+                    (Some(rc.bounds[3].0), Some(rc.bounds[3].1)),
+                )),
+            ).unwrap(),
+        };
 
-        // Propagate the center detection
         let center_pt = match construct_orbit(center_det, &refined_ic) {
             Some(v) => v,
             None => continue,
@@ -373,9 +375,8 @@ fn refine_single_trajectory(
             let [dphi, dtheta] = angular_separation(center_pt, pt);
             let sep = (dphi * dphi + dtheta * dtheta).sqrt();
 
-
-            // Note: +0.5 margin 
             if sep > epsilon + 0.5 {
+                // println!("Detection ID {} has separation {:.2} arcsec, which is greater than epsilon {:.2} arcsec. Excluding this cell.", id, sep, epsilon);
                 all_within = false;
                 break;
             }
@@ -393,7 +394,6 @@ fn refine_single_trajectory(
         return Vec::new();
     }
 
-    // Sort by average separation (ascending) and keep up to `max_keep`
     candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Greater));
     candidates
         .into_iter()
@@ -406,14 +406,13 @@ pub fn refine_with_grid_cache_sparse(
     trajs: &[(Trajectory, InitialCondition)],
     grid_cache: &Arc<Mutex<HashMap<GridCacheKey, Vec<Cell>>>>,
     det_map: &HashMap<u64, Detection>,
-    cluster_radius: f64, // unused but kept for compatibility
+    cluster_radius: f64,
     epsilon: f64,
     t_bounds: (f64, f64),
     max_keep: usize,
 ) -> Vec<(Trajectory, InitialCondition)> {
     println!("Refining trajectories with epsilon: {}", epsilon);
 
-    // For each trajectory, return up to `max_keep` candidate pairs, then flatten
     let lists: Vec<Vec<(Trajectory, InitialCondition)>> = trajs
         .par_iter()
         .map(|(traj, original_ic)| {

@@ -33,7 +33,7 @@ use crate::sync::sync_detection_to_orbit as construct_orbit;
 use crate::sparse_linking_stuff::config::{Config, Cli};
 use crate::sparse_linking_stuff::ccd::*;
 use crate::sparse_linking_stuff::non_detection_prob::*;
-use crate::sparse_linking_stuff::io::ExposureRow;
+use crate::sparse_linking_stuff::utils::ExposureRow;
 use crate::sparse_linking_stuff::grid::GridCacheKey;
 use crate::sparse_linking_stuff::utils::*;
 
@@ -95,6 +95,9 @@ pub fn run_ic_cluster_and_trajectory_search(
                 println!("Skipping invalid KD point: {:?} from det {}", pt, det.intid);
                 continue;
             }
+            // Print the points
+            // println!("Valid KD point: {:?} from det {}", pt, det.intid);
+
             points.push(pt);
             intids.push(det.intid as u64);
             point_map.insert(det.intid as u64, pt);
@@ -239,6 +242,8 @@ pub fn try_link(
     pipeline_metrics: &Arc<PipelineMetrics>,
 ) -> Option<Link> {
 
+    //println!("Trying trajectory with length {}", traj.detection_ids.len());
+
     let ids: HashSet<usize> = traj.detection_ids.iter().copied().collect();
     let mut tried_detection_sets: HashSet<BTreeSet<usize>> = HashSet::new();
 
@@ -247,12 +252,14 @@ pub fn try_link(
     /// a. has already been accepted as a link 
     /// b. has failed (this should only be if it fails for the same IC I think)
     if trajectory_filter.lock().unwrap().should_skip(&ids) {
+        //println!("Skipping trajectory with detection IDs {:?} because it has already been accepted or failed", ids);
         return None;
     }
 
 
     /// Get the detections from in the trajecory, and get the set of all possible triplets
     let cluster_detections: Vec<&Detection> = ids.iter().map(|&id| det_map.get(&(id as u64)).unwrap()).collect();
+    //println!("Trajectory has {} detections after collecting from det_map", cluster_detections.len());
     let triplets = cluster_detections.clone().into_iter().combinations(3);
 
     for mut triplet in triplets {
@@ -263,6 +270,7 @@ pub fn try_link(
         if nights.len() != 3 {
             continue;
         }
+        //println!("Trying triplet with detection IDs {:?} and nights {:?}", triplet.iter().map(|d| d.intid).collect::<Vec<_>>(), nights);
 
         /// Ensure the triplet duration is long enough
         let span = triplet[2].epoch - triplet[0].epoch;
@@ -286,6 +294,8 @@ pub fn try_link(
             _ => continue,
         };
 
+        //println!("Gauss fit successful for triplet with detection IDs {:?}. Number of solutions: {}", triplet.iter().map(|d| d.intid).collect::<Vec<_>>(), orbits.len());
+
         /// Skip very hyperbolic orbits
         let mut orbit = orbits.into_iter().next().unwrap();
         if orbit.e() > 3.0 {
@@ -296,7 +306,10 @@ pub fn try_link(
         /// Find the mahalanobis residuals for this gauss fit
         let (resids, _, _) = match residuals(&cluster_detections, &mut orbit, kernel) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                //println!("Failed to compute residuals for gauss fit of triplet with detection IDs {:?}. Skipping.", triplet.iter().map(|d| d.intid).collect::<Vec<_>>());
+                continue;
+            }
         };
 
         /// ONLY KEEP detections less than 7 sigma from the gauss fit (I was previously using 5? I think I changed it to 7 for some fake.
@@ -308,6 +321,8 @@ pub fn try_link(
             .filter(|(_, r)| **r < 7.0)
             .map(|(&d, _)| d.clone())
             .collect();
+
+        //println!("{} detections within 7 sigma of gauss fit for trajectory with detection IDs {:?}. Gauss fit has a={:.2} au, e={:.2}, inc={:.2} deg", dets.len(), triplet.iter().map(|d| d.intid).collect::<Vec<_>>(), orbit.a(), orbit.e(), orbit.inc().to_degrees());
 
         let surviving_ids: HashSet<usize> = dets.iter().map(|d| d.intid as usize).collect();
         if dets.len() < config.min_detections || !ids.iter().all(|id| surviving_ids.contains(id)) {
@@ -351,7 +366,9 @@ pub fn try_link(
             Err(_) => continue,
         };
 
+
         /// Fit the orbit with SpaceRocks Levenberg-Marquardt fitter, using the gauss fit as a guess
+        //println!("Fitting orbit with LM for trajectory with detection IDs {:?} and initial guess from gauss fit", ids);
         let sr_fit = match fit_orbit_lm(&obs_refs, &theta0, sim0) {
             Ok(Some(f)) => f,
             _ => continue,
@@ -369,8 +386,8 @@ pub fn try_link(
 
         /// NOTE: The semi-major axis cut is disabled for now, because it was a couple of marginal real things. The cost is an increased number of FPs. 
         /// For now, just ensuring that our chisq/dof is not too high. NEED TO CHECK chi2 in SR, im not posiitive it's being calculated correctly.
-        // if fit.chisq / fit.dof > 5.0 || fit.rock.a() < 0.0 { 
-        if fit.chisq / fit.dof > 5.0 {
+        if fit.chisq / fit.dof > 5.0 || fit.rock.a() < 0.0 { 
+        // if fit.chisq / fit.dof > 5.0 {
             continue;
         }
 
@@ -393,6 +410,7 @@ pub fn try_link(
         };
 
         if should_accept {
+            println!("Accepting trajectory with detection IDs {:?} as a link! Chisq/dof: {:.2}", ids, fit.chisq / fit.dof);
             trajectory_filter.lock().unwrap().add_accepted(&ids);
             return Some(Link::new(
                 0,

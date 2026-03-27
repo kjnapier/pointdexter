@@ -35,7 +35,7 @@ use pointdexter::sync::sync_detection_to_orbit as construct_orbit;
 use pointdexter::sparse_linking_stuff::config::{Config, Cli};
 use pointdexter::sparse_linking_stuff::ccd::*;
 use pointdexter::sparse_linking_stuff::non_detection_prob::*;
-use pointdexter::sparse_linking_stuff::io::ExposureRow;
+use pointdexter::sparse_linking_stuff::utils::ExposureRow;
 use pointdexter::sparse_linking_stuff::grid::GridCacheKey;
 
 use spacerocks::StateVector;
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up constants and epsilon ladder
     const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / std::f64::consts::PI;
-    let epsilon_values = vec![15.0, 5.0, 3.0, 1.0]; // CURRENT USE
+    let epsilon_values = vec![45.0, 15.0, 5.0, 3.0, 1.0]; // CURRENT USE
     let t_bounds = (0.0, config.t_max);
 
     let mut kernel = SpiceKernel::new();
@@ -98,9 +98,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let det_path = config.detection_catalog.clone();
     
     // Read in my catalogs
-    let ics: Vec<InitialCondition> = pointdexter::io::load_ics::load_initial_conditions(&ic_path, "spherical", "SSB", config.t_ref)?;
+    let ics: Vec<InitialCondition> = pointdexter::io::load_ics::load_initial_conditions(&ic_path, "keplerian", "SSB", config.t_ref)?;
     let detections: Vec<Detection> = pointdexter::io::load_detections::load_detections(&det_path, &"J2000", &kernel)?;
-    let all_x3_exps: Vec<ExposureRow> = pointdexter::sparse_linking_stuff::io::read_exposure_metadata(&config.all_x3_exps_file)?;
+    let all_x3_exps: Vec<ExposureRow> = read_exposure_metadata(&config.all_x3_exps_file)?;
 
     let dets_by_expnum = index_detections_by_expnum(&detections);
 
@@ -155,6 +155,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("Initial trajectory count: {}", current_trajs.len());
+
+
+        //  // Print the IC IDs of all curent trajectories for debugging
+        // for traj in &current_trajs {
+        //     println!("Trajectory with center ID: {}", traj.1.id);
+        // }
+           
 
         /// Remove for analyzing initial trajectories
         for &epsilon in &epsilon_values {
