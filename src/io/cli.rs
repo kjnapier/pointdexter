@@ -15,7 +15,14 @@ pub struct Config {
     pub min_detections: usize,
     pub max_detections: usize,
     pub min_duration: f64,
-    pub min_nites: usize,
+    pub min_nights: usize,
+
+    pub max_dt: f64,
+
+    pub min_unique_times: usize,
+    pub min_points_per_cell: usize,
+    pub healpix_depth: u8, 
+    pub sigma_threshold: f64,
 
     pub spice_path: String,
     pub detection_catalog: String,

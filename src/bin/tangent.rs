@@ -319,6 +319,16 @@ pub fn sort_detections_into_exposures(detections: &Vec<Detection>) -> Vec<Exposu
 
     let mut exposures: Vec<Exposure> = Vec::with_capacity(exposure_groups.len());
     for (idx, group) in exposure_groups.iter().enumerate() {
+        // Calculate the central rho vector for this exposure as the mean of the detections in the group.
+        // This could also be passed in as an argument.
+        let mut central_rho = Vector3::zeros();
+        for det in group.iter() {
+            central_rho += det.rho_hat;
+        }
+        central_rho /= group.len() as f64;
+        // Normalize the central rho vector so that it is a unit vector.
+        central_rho = central_rho.normalize();
+
         let exposure = Exposure {
             id: format!("exposure_{}", idx),
             epoch: group[0].epoch,
@@ -327,6 +337,7 @@ pub fn sort_detections_into_exposures(detections: &Vec<Detection>) -> Vec<Exposu
             observer_position: group[0].observer_position,
             observer_velocity: group[0].observer_velocity,
             reference_plane: group[0].reference_plane.clone(),
+            central_rho: central_rho,
         };
         exposures.push(exposure);
     }
@@ -366,7 +377,7 @@ pub fn sync_detections(exposures: &Vec<TangentPlaneExposure>, mu: f64, gamma: f6
         let mut synced_exposure: Vec<(f64, f64)> = Vec::new();
         let t = exposure.epoch - ref_epoch;
 
-        let rho2 = (1.0 + mean_theta_x * mean_theta_x + mean_theta_y * mean_theta_y)*(z0 - exposure.xyz_e.z).powi(2);
+        let rho2 = (1.0 + mean_theta_x * mean_theta_x + mean_theta_y * mean_theta_y)*(z0 - exposure.ze).powi(2);
         let rho = rho2.sqrt();
 
         // Improve light time correction at some point.
@@ -376,14 +387,14 @@ pub fn sync_detections(exposures: &Vec<TangentPlaneExposure>, mu: f64, gamma: f6
         let tp = t - dt;
         let f = (1.0 - 0.5 * mm_sqr * tp * tp);
         let g = tp;
-        let fac = (1.0 + g/f * gdot - gamma/f * exposure.xyz_e.z);
+        let fac = (1.0 + g/f * gdot - gamma/f * exposure.ze);
 
         for (theta_x, theta_y) in exposure.theta_x.iter().zip(exposure.theta_y.iter()) {
-            let phi_x = theta_x * fac + gamma/f * exposure.xyz_e.x;
-            let phi_y = theta_y * fac + gamma/f * exposure.xyz_e.y;
+            let phi_x = theta_x * fac + gamma/f * exposure.xe;
+            let phi_y = theta_y * fac + gamma/f * exposure.ye;
             let alpha = phi_x - g/f * adot;
             let beta = phi_y - g/f * bdot;
-            //println!("Exposure {}: alpha = {}, beta = {}", exposure.id, alpha, beta);
+            
             alphas.push(alpha);
             betas.push(beta);
         }
