@@ -30,13 +30,38 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
 
     fn req_f64<'a>(df: &'a DataFrame, name: &str) -> PolarsResult<&'a Float64Chunked> {
         let ca = col_series(df, name)?.f64()?;
+        
         if ca.null_count() != 0 {
+
+            let mask = ca.is_null();
+            let filtered_s = ca.filter(&mask)?; // Filter out nulls
+            
+            let null_indices: Vec<usize> = mask
+                .into_iter() // Iterate over the BooleanChunked as an iterator of Option<bool>
+                .enumerate() // Add index to each element
+                .filter_map(|(index, is_null)| {
+                    // Keep the index if the value is Some(true)
+                    if matches!(is_null, Some(true)) {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            println!("\nRow numbers (indices) of nulls: {:?}", null_indices);
+
             return Err(PolarsError::ComputeError(
                 format!("Required column '{name}' contains nulls.").into(),
             ));
         }
         Ok(ca)
     }
+
+    use polars::prelude::*;
+
+
+
 
     fn opt_f64<'a>(df: &'a DataFrame, name: &str) -> PolarsResult<Option<&'a Float64Chunked>> {
         if !has_col(df, name) {
@@ -279,6 +304,10 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
 
         if let Some(ca) = ast_ucty {
             det.ast_ucty = ca.get(i);
+            // Convert from arcseconds to radians for internal use
+            if let Some(ucty) = det.ast_ucty {
+                det.ast_ucty = Some(ucty * std::f64::consts::PI / 180.0 / 3600.0);
+            }
         }
         if let Some(ca) = magnitude {
             det.mag = ca.get(i);

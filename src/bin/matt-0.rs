@@ -29,10 +29,12 @@ use pointdexter::load_detections;
 use pointdexter::load_ics::load_initial_conditions;
 use pointdexter::InitialCondition;
 
-const MAX_DT: f64 = 4000.0; // days
-const MIN_UNIQUE_TIMES: usize = 12;
-const MIN_POINTS_PER_CELL: usize = 6;
-const MIN_NIGHTS: usize = 6;
+use std::io::{BufWriter, Write};
+
+//const MAX_DT: f64 = 4000.0; // days
+//const MIN_UNIQUE_TIMES: usize = 12;
+//const MIN_POINTS_PER_CELL: usize = 6;
+//const MIN_NIGHTS: usize = 6;
 
 const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / PI;
 
@@ -46,47 +48,64 @@ pub fn sync_detections_to_orbit(detections: &Vec<Detection>, ic: &InitialConditi
     synced_points
 }
 
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-    type Tree = ImmutableKdTree<f64, u32, 3, 32>; // item is u32 index into `points` array, 3D points, leaf capacity 32
-
-    let depth = 15_u8;
-    let nside = nside(depth) as u64;
-    let npix = 12 * nside * nside;
-    println!("Total HEALPix cells at depth {}: {}", depth, npix);
-    println!("Nside at depth {}: {} {}", depth, nside, (4.0*PI/(npix as f64)).sqrt()*(180.0/PI)*60.0*60.0);
-    let nested: &Layer = get(depth);
-
-    // Calculate cluster angles.
-    const EPS: f64 = 7.0 / ARCSEC_PER_RAD; 
-    let cluster_r2 = 2.0 * (1.0 - EPS.cos());
-    let obliq = 84381.448/3600.0;
-
-    println!("Cluster radius (radians): {}", EPS*ARCSEC_PER_RAD);
-    
     // We need to make this more flexible.
     let args = Cli::try_parse()?;
     let f = std::fs::File::open(args.config)?;
     let config: Config = serde_yaml::from_reader(f)?;
+
+    let mut file = File::create(&config.output_path)?;    
+    let cluster_file = std::sync::Mutex::new(&mut file);
+
+    writeln!(cluster_file.lock().unwrap(), "# Configuration:")?;
+    // Print the name of the output file in the configuration for easy reference.
+    writeln!(cluster_file.lock().unwrap(), "# Output path: {}", config.output_path)?;
+
+    let depth = config.healpix_depth;
+    let nside = nside(depth) as u64;
+    let npix = 12 * nside * nside;
+    // Write the header information to the output file.
+    writeln!(cluster_file.lock().unwrap(), "# Total HEALPix cells at depth {}: {}", depth, npix)?;
+    writeln!(cluster_file.lock().unwrap(), "# Nside at depth {}: {} {}", depth, nside, (4.0*PI/(npix as f64)).sqrt()*(180.0/PI)*60.0*60.0)?;
+    let nested: &Layer = get(depth);
+
+    // Calculate cluster angles.
+    //const EPS: f64 = 7.0 / ARCSEC_PER_RAD; 
+    let eps = config.epsilon_arcsec / ARCSEC_PER_RAD;
+    let cluster_r2 = 2.0 * (1.0 - eps.cos());
+    let obliq = 84381.448/3600.0;
+
+    // Write the rest of the configuration parameters to the output file for easy reference.
+    writeln!(cluster_file.lock().unwrap(), "# Cluster radius (radians): {}", eps*ARCSEC_PER_RAD)?;
 
     let mut kernel = SpiceKernel::new();
     kernel.load_spk(format!("{}/sb441-n16.bsp", config.spice_path).as_str())?;
     kernel.load_spk(format!("{}/de440s.bsp", config.spice_path).as_str())?;
     kernel.load_bpc(format!("{}/earth_1962_240827_2124_combined.bpc", config.spice_path).as_str())?;
 
+    writeln!(cluster_file.lock().unwrap(), "# max_detections: {}", config.max_detections)?;
+    writeln!(cluster_file.lock().unwrap(), "# max_dt: {}", config.max_dt)?;
+    writeln!(cluster_file.lock().unwrap(), "# min_unique_times: {}", config.min_unique_times)?;
+    writeln!(cluster_file.lock().unwrap(), "# min_points_per_cell: {}", config.min_points_per_cell)?;
+
     // Load detections from catalog. They will automatically be transformed to the desired reference plane. 
     // The observer positions and velocities will be rotated accordingly.
-    println!("Loading detections...");
+    writeln!(cluster_file.lock().unwrap(), "# Loading detections...")?;
     let mut detections = load_detections(&config.detection_catalog, &config.orbit_reference_plane, &kernel)?;
-    println!("Loaded {} detections.", detections.len());
+    writeln!(cluster_file.lock().unwrap(), "# Loaded {} detections.", detections.len())?;
 
     // Load initial conditions from file.
-    println!("Loading initial conditions...");
+    writeln!(cluster_file.lock().unwrap(), "# Loading initial conditions...")?;
     let mut ics = load_initial_conditions(&config.initial_conditions_file, &config.ic_type, &config.ic_origin, config.reference_epoch)?;
-    println!("Loaded {} initial conditions.", ics.len());
+    writeln!(cluster_file.lock().unwrap(), "# Loaded {} initial conditions.", ics.len())?;
+    cluster_file.lock().unwrap().flush()?;
 
-   
+
+    //let mut cluster_file = std::fs::File::create("clusters.txt")?;
+    //let cluster_file = std::sync::Mutex::new(&mut cluster_file);
+
+
     let start_time = Instant::now();
     let n_ics = ics.len();
 
@@ -120,12 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // let nside = nside(depth) as u64;
-        // let npix = 12 * nside * nside;
-
         let radius = 2.0*(4.0*PI/(npix as f64)).sqrt();
         let mut hp_sum_map_v2 = sum_hp_map_neighbors_v2(&hp_map_counts, nested, radius);
-        let peaks = find_non_strict_peaks(&hp_sum_map_v2, depth, MIN_UNIQUE_TIMES);
+        let peaks = find_non_strict_peaks(&hp_sum_map_v2, depth, config.min_unique_times);
 
         // Keep track of the mapping from intid → index in points array for efficient lookup after neighbor queries.
         let mut intid_idx_hash: HashMap<i32, usize> = HashMap::new();
@@ -141,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for peak in peaks.iter() {
             let cell = peak.0;
             let cell_count = peak.1;
-            if cell_count < MIN_UNIQUE_TIMES {
+            if cell_count < config.min_unique_times {
                 continue;
             }
             not_skipped += 1;
@@ -171,12 +187,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 nn.item = intids[nn.item as usize] as i32;
             }
 
-            if cluster.len() < MIN_UNIQUE_TIMES {
+            if cluster.len() < config.min_unique_times {
                 continue;
             }
                                 
             // Cull the cluster to remove outliers and construct the Cluster struct with local coordinates.
-            let clust = cull_cluster(&detections, &intid_idx_hash, &points, cell_point, &cluster, ic.epoch, MAX_DT, MIN_UNIQUE_TIMES, MIN_NIGHTS);
+            let clust = cull_cluster(&detections, &intid_idx_hash, &points, cell_point, &cluster, ic.epoch, config.max_dt, config.min_unique_times, config.min_nights);
             if clust.is_none() {
                 continue;
             }
@@ -186,10 +202,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let fit_result = iterative_reject(
                 &t, &mxe, &mye, &theta_x, &theta_y, &ast_ucty, &ast_ucty,
-                5.0,   // sigma threshold
-                MIN_POINTS_PER_CELL,  // stop if fewer than a threhold number of points remain
-                MIN_UNIQUE_TIMES,  // stop if fewer than a threhold number of unique observation times remain
-                MIN_NIGHTS, // stop if fewer than a threshold number of unique nights remain
+                config.sigma_threshold,   // sigma threshold
+                config.min_points_per_cell,  // stop if fewer than a threhold number of points remain
+                config.min_unique_times,  // stop if fewer than a threhold number of unique observation times remain
+                config.min_nights, // stop if fewer than a threshold number of unique nights remain
             );
             
             let fit_final = match fit_result {
@@ -209,7 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|&idx| clust.local_intids[idx] as usize)
                 .collect();
             
-            out.push_str("# intid     detid         t(days)     theta_x(\")  theta_y(\")  x_model(\")  y_model(\")    sig_x     sig_y\n");
+ 
+            out.push_str("# detid             epoch          RA(deg)      sig_x(\")   Dec(deg)   sig_y(\")  obs_x        obs_y           obs_z      obscode  mag mag_sig  filt ");
+            out.push_str("  intid      t(days)     theta_x(\")  theta_y(\")  x_model(\")  y_model(\")  pull_x      pull_y \n");
             let mut kept_count = 0;
             for i in 0..t.len() {
                 if rejected_indices.contains(&i) {
@@ -225,17 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pull = pull_x.abs().max(pull_y.abs());
                 let intid = clust.local_intids[i];
                 let detid = &detections[intid as usize].detid.clone().unwrap_or("".to_string());
-                out.push_str(&format!("{:8} {:12} {:12.6}   {:8.4}     {:8.4}    {:8.4}   {:8.4}.  {:8.4}.  {:8.4}\n", clust.local_intids[i], detid, t[i], theta_x[i]*206265., theta_y[i]*206265., x_model*206265., y_model*206265., pull_x, pull_y));
-            }
-            out.push_str(&format!("# Kept {} detections in fit, IC {}\n", kept_count, ii+1));
-            out.push_str("# detid         epoch        RA(deg)   sig_x(\")   Dec(deg)  sig_y(\")  obs_x        obs_y           obs_z      obscode  mag\n");
-            for i in 0..t.len() {
-                if rejected_indices.contains(&i) {
-                    continue;
-                }
-                
-                let intid = clust.local_intids[i];
-                let detid = &detections[intid as usize].detid.clone().unwrap_or("".to_string());
+                 
                 let objid = &detections[intid as usize].objid.clone().unwrap_or("".to_string());
                 let filt = &detections[intid as usize].filter.clone().unwrap_or("".to_string());
                 let rho_hat = detections[clust.local_intids[i] as usize].rho_hat; 
@@ -248,20 +256,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ra_deg = ra * 180.0 / PI;
                 let dec_deg: f64 = dec * 180.0 / PI;
                 let epoch = detections[clust.local_intids[i] as usize].epoch;
-                let obscode = "X05"; // TODO.
+                
+                let obscode = &detections[clust.local_intids[i] as usize].obscode.clone().unwrap_or("".to_string());
                 let mag = detections[clust.local_intids[i] as usize].mag.unwrap_or(0.0);
                 let mag_sig = detections[clust.local_intids[i] as usize].mag_ucty.unwrap_or(0.0);
                 let obs_pos = &detections[clust.local_intids[i] as usize].observer_position;
                 let obs_pos2 = ecliptic_to_equatorial_vector(*obs_pos, obliq * std::f64::consts::PI / 180.0);
 
-                out.push_str(&format!("ic_00 {:12} {:12.6} {:10.6}   {:6.3}   {:10.6}   {:6.3}  {:13.10}  {:13.10}  {:13.10}   {}   {:.2} {:.2} {} {} \n", 
+                out.push_str(&format!("{:12} {:13.7} {:11.7}   {:6.3}   {:11.7}   {:6.3}  {:13.10}  {:13.10}  {:13.10}   {}   {:.3} {:.3} {:6} {} ",
                     detid, epoch, ra_deg, ast_ucty[i]*206265., dec_deg, ast_ucty[i]*206265., obs_pos2[0], obs_pos2[1], obs_pos2[2], obscode, mag, mag_sig, filt, objid));
+                out.push_str(&format!("{:8} {:12.6}   {:8.4}     {:8.4}    {:8.4}   {:8.4}.  {:8.4}.  {:8.4}\n", 
+                    clust.local_intids[i], t[i], theta_x[i]*206265., theta_y[i]*206265., x_model*206265., y_model*206265., pull_x, pull_y));            
+            
             }
+            out.push_str(&format!("# Kept {} detections in fit, IC {}\n", kept_count, ii+1));
+            out.push_str("# Fit finished.\n");
+            
+            
                 
 
         }
-        out.push_str(&format!("# Finished processing IC {} of {}: {} cells, {} of which had > {} points.\n", ii+1, n_ics, peaks.len(), not_skipped, MIN_UNIQUE_TIMES));
-        print!("{}", out);
+        out.push_str(&format!("# Finished processing IC {} of {}: {} cells, {} of which had > {} points.\n", ii+1, n_ics, peaks.len(), not_skipped, config.min_unique_times));
+        // Write the output for this IC to the output file.
+        write!(cluster_file.lock().unwrap(), "{}", out);
+        //print!("{}", out);
     });
                 
     

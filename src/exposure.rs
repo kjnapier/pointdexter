@@ -20,8 +20,15 @@ pub struct TangentPlaneExposure {
     pub id: String,
     pub epoch: f64,
 
-    pub xyz_e: Vector3<f64>,
+    pub xe: f64,
+    pub ye: f64,
+    pub ze: f64,
+
+    //pub xyz_e: Vector3<f64>,
     
+    pub theta_x0: f64,
+    pub theta_y0: f64,
+
     pub theta_x: Vec<f64>,
     pub theta_y: Vec<f64>,
 }
@@ -31,6 +38,7 @@ pub struct Exposure {
     pub id: String,
     pub epoch: f64,
     pub filter: Option<String>,
+    pub central_rho: Vector3<f64>,
 
     pub detections: Vec<Vector3<f64>>,
     pub observer_position: Vector3<f64>,
@@ -60,12 +68,25 @@ impl Exposure {
 
         }
 
+        // Calculate the central theta_x0 and theta_y0 for this exposure as the projection of the central rho vector.
+        let central_proj = rot * self.central_rho;
+        let theta_x0 = central_proj[0]/central_proj[2];
+        let theta_y0 = central_proj[1]/central_proj[2];
+        
+
         let xyz_e = rot * self.observer_position;
+        let xe = xyz_e[0];
+        let ye = xyz_e[1];
+        let ze = xyz_e[2];
 
         TangentPlaneExposure {
             id: self.id.clone(),
             epoch: self.epoch,
-            xyz_e,
+            xe,
+            ye,
+            ze,
+            theta_x0,
+            theta_y0,
             theta_x,
             theta_y,
         }
