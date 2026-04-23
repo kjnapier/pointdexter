@@ -29,6 +29,8 @@ use pointdexter::load_detections;
 use pointdexter::load_ics::load_initial_conditions;
 use pointdexter::InitialCondition;
 
+use std::io::{BufWriter, Write};
+
 //const MAX_DT: f64 = 4000.0; // days
 //const MIN_UNIQUE_TIMES: usize = 12;
 //const MIN_POINTS_PER_CELL: usize = 6;
@@ -53,11 +55,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let f = std::fs::File::open(args.config)?;
     let config: Config = serde_yaml::from_reader(f)?;
 
+    let mut file = File::create(&config.output_path)?;    
+    let cluster_file = std::sync::Mutex::new(&mut file);
+
+    writeln!(cluster_file.lock().unwrap(), "# Configuration:")?;
+    // Print the name of the output file in the configuration for easy reference.
+    writeln!(cluster_file.lock().unwrap(), "# Output path: {}", config.output_path)?;
+
     let depth = config.healpix_depth;
     let nside = nside(depth) as u64;
     let npix = 12 * nside * nside;
-    println!("# Total HEALPix cells at depth {}: {}", depth, npix);
-    println!("# Nside at depth {}: {} {}", depth, nside, (4.0*PI/(npix as f64)).sqrt()*(180.0/PI)*60.0*60.0);
+    // Write the header information to the output file.
+    writeln!(cluster_file.lock().unwrap(), "# Total HEALPix cells at depth {}: {}", depth, npix)?;
+    writeln!(cluster_file.lock().unwrap(), "# Nside at depth {}: {} {}", depth, nside, (4.0*PI/(npix as f64)).sqrt()*(180.0/PI)*60.0*60.0)?;
     let nested: &Layer = get(depth);
 
     // Calculate cluster angles.
@@ -66,28 +76,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_r2 = 2.0 * (1.0 - eps.cos());
     let obliq = 84381.448/3600.0;
 
-    println!("# Cluster radius (radians): {}", eps*ARCSEC_PER_RAD);
+    // Write the rest of the configuration parameters to the output file for easy reference.
+    writeln!(cluster_file.lock().unwrap(), "# Cluster radius (radians): {}", eps*ARCSEC_PER_RAD)?;
 
     let mut kernel = SpiceKernel::new();
     kernel.load_spk(format!("{}/sb441-n16.bsp", config.spice_path).as_str())?;
     kernel.load_spk(format!("{}/de440s.bsp", config.spice_path).as_str())?;
     kernel.load_bpc(format!("{}/earth_1962_240827_2124_combined.bpc", config.spice_path).as_str())?;
 
-    println!("# max_detections: {}", config.max_detections);
-    println!("# max_dt: {}", config.max_dt);
-    println!("# min_unique_times: {}", config.min_unique_times);
-    println!("# min_points_per_cell: {}", config.min_points_per_cell);
+    writeln!(cluster_file.lock().unwrap(), "# max_detections: {}", config.max_detections)?;
+    writeln!(cluster_file.lock().unwrap(), "# max_dt: {}", config.max_dt)?;
+    writeln!(cluster_file.lock().unwrap(), "# min_unique_times: {}", config.min_unique_times)?;
+    writeln!(cluster_file.lock().unwrap(), "# min_points_per_cell: {}", config.min_points_per_cell)?;
 
     // Load detections from catalog. They will automatically be transformed to the desired reference plane. 
     // The observer positions and velocities will be rotated accordingly.
-    println!("# Loading detections...");
+    writeln!(cluster_file.lock().unwrap(), "# Loading detections...")?;
     let mut detections = load_detections(&config.detection_catalog, &config.orbit_reference_plane, &kernel)?;
-    println!("# Loaded {} detections.", detections.len());
+    writeln!(cluster_file.lock().unwrap(), "# Loaded {} detections.", detections.len())?;
 
     // Load initial conditions from file.
-    println!("# Loading initial conditions...");
+    writeln!(cluster_file.lock().unwrap(), "# Loading initial conditions...")?;
     let mut ics = load_initial_conditions(&config.initial_conditions_file, &config.ic_type, &config.ic_origin, config.reference_epoch)?;
-    println!("# Loaded {} initial conditions.", ics.len());
+    writeln!(cluster_file.lock().unwrap(), "# Loaded {} initial conditions.", ics.len())?;
+    cluster_file.lock().unwrap().flush()?;
+
+
+    //let mut cluster_file = std::fs::File::create("clusters.txt")?;
+    //let cluster_file = std::sync::Mutex::new(&mut cluster_file);
+
 
     let start_time = Instant::now();
     let n_ics = ics.len();
@@ -260,7 +277,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         }
         out.push_str(&format!("# Finished processing IC {} of {}: {} cells, {} of which had > {} points.\n", ii+1, n_ics, peaks.len(), not_skipped, config.min_unique_times));
-        print!("{}", out);
+        // Write the output for this IC to the output file.
+        write!(cluster_file.lock().unwrap(), "{}", out);
+        //print!("{}", out);
     });
                 
     
