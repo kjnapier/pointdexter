@@ -24,7 +24,7 @@ rayon = "*"
 
 # anyhow = "*"
 cdshealpix = { git = "https://github.com/cds-astro/cds-healpix-rust.git" }
-plotly = { version = "*" , features = ["kaleido"] }  
+# plotly = { version = "*" , features = ["kaleido"] }  
 # argmin = { version = "*"}
 # argmin-math = { version = "*" }
 # argmin-observer-slog = { version = "*" }

@@ -112,7 +112,7 @@ impl InitialCondition {
         // This could be inverted, so that the values of s are the independent variable
         // and the dt values are computed from them.
         for &dt in &dt_values {
-            let s = solve_for_universal_anomaly(r, vr, alpha, mu, dt, 1e-12, 100)?;
+            let s = solve_for_universal_anomaly(r, vr, alpha, mu, dt, 1e-10, 100)?;
             s_values.push(s);
         }
 

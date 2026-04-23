@@ -16,16 +16,16 @@ use pointdexter::gauss::gauss;
 
 use std::io::Write;
 
-use plotly::{Plot, Scatter};
-use plotly::common::Mode;
+// use plotly::{Plot, Scatter};
+// use plotly::common::Mode;
 use indicatif::ParallelProgressIterator;
 use indicatif::ProgressIterator;
 
 use kiddo::{KdTree, SquaredEuclidean};
 use kiddo::immutable::float::kdtree::ImmutableKdTree;
 
-use plotly::common::Marker;
-use plotly::layout::{Axis, Layout};
+// use plotly::common::Marker;
+// use plotly::layout::{Axis, Layout};
 
 fn squared_euclid_to_angle_rad(d2: f64) -> f64 {
     // For unit vectors: dot = 1 - d^2/2

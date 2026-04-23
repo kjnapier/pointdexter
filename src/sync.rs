@@ -63,7 +63,8 @@ pub fn sync_detection_to_orbit(det: &Detection, ic: &InitialCondition) -> Option
 
     let vo = ic.h / r;
     let vsq = (ic.energy + ic.mu / r).max(0.0) * 2.0; // ensure non-negative vsq
-    let vr = (vsq - vo * vo).max(0.0).sqrt(); // ensure non-negative argument for sqrt
+    // let vr = (vsq - vo * vo).max(0.0).sqrt(); // ensure non-negative argument for sqrt
+    let vr = ic.vr_at_epoch(light_corrected_epoch);
     
     if (r_vec[2] / r).abs() > ic.sin_latitude_threshold {
         return None;
