@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 
 spacerocks = { git = "https://github.com/kjnapier/spacerocks" }
-polars = { version = "0.50.0", features = ["lazy"] }
+polars = { version = "0.50.0", features = ["lazy", "decompress"] }
 nalgebra = { version = "0.32.2" }
 
 # kiddo = { git = "https://github.com/sdd/kiddo" }

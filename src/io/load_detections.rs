@@ -222,6 +222,23 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
 
     // ---------- optional metadata ----------
     let ast_ucty = opt_f64(&df, "ast_ucty")?;
+    // ast_ucty is arcsec on input, converted to radians below. A caller that already wrote
+    // radians gets converted twice (0.2" -> 1 uas), inflating every pull by ~2e5 so the
+    // sigma-clip rejects the whole clump instead of the outliers. Nothing real is this
+    // small -- and a literal 0 divides by zero -- so refuse to load.
+    if let Some(ca) = ast_ucty {
+        for i in 0..n {
+            if let Some(v) = ca.get(i) {
+                if v < 1e-4 {
+                    return Err(format!(
+                        "ast_ucty {:.3e} at row {} of {}: expected arcsec, this looks like radians",
+                        v, i, file_path
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     let magnitude = opt_f64(&df, "mag")?;
     let mag_ucty = opt_f64(&df, "mag_ucty")?;
     let filter = opt_string_like(&df, "filter")?;
@@ -242,7 +259,7 @@ pub fn load_detections(file_path: &str, reference_plane: &str, kernel: &SpiceKer
     for i in 0..n {
         let ra = ra_deg.get(i).unwrap() * std::f64::consts::PI / 180.0;
         let dec = dec_deg.get(i).unwrap() * std::f64::consts::PI / 180.0;
-        let epoch = Time::new(epoch_jd.get(i).unwrap(), "utc", "jd")?;
+        let epoch = Time::new(epoch_jd.get(i).unwrap(), "tdb", "jd")?;
 
         // Per-row rule:
         // 1) if obscode present on that row -> use it

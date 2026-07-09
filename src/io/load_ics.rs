@@ -90,7 +90,7 @@ pub fn read_initial_conditions_kep(
     reference_epoch_jd: f64,
 ) -> Result<Vec<InitialCondition>, Box<dyn std::error::Error>> {
     let df = read_csv(path)?;
-    let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
+    let epoch = Time::new(reference_epoch_jd, "tdb", "jd")?;
 
     let q = df.column("q")?.as_series().unwrap().f64()?;
     let e = df.column("e")?.as_series().unwrap().f64()?;
@@ -125,7 +125,7 @@ pub fn read_initial_conditions_sph(
     reference_epoch_jd: f64,
 ) -> Result<Vec<InitialCondition>, Box<dyn std::error::Error>> {
     let df = read_csv(path)?;
-    let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
+    let epoch = Time::new(reference_epoch_jd, "tdb", "jd")?;
 
     let r = df.column("r")?.as_series().unwrap().f64()?;
     let vr = df.column("vr")?.as_series().unwrap().f64()?;
@@ -156,7 +156,7 @@ pub fn read_initial_conditions_sph(
 
 pub fn read_initial_conditions_3d(path: &str, mu: f64, reference_epoch_jd: f64) -> Result<Vec<InitialCondition3D>, Box<dyn std::error::Error>> {
     let df = read_csv(path)?;
-    let epoch = Time::new(reference_epoch_jd, "utc", "jd")?;
+    let epoch = Time::new(reference_epoch_jd, "tdb", "jd")?;
 
     let r = df.column("r")?.as_series().unwrap().f64()?;
     let vr = df.column("vr")?.as_series().unwrap().f64()?;
