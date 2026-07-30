@@ -27,3 +27,6 @@ pub mod hpix;
 
 pub mod exposure;
     pub use exposure::*;
+
+pub mod spherical_pair;
+    pub use spherical_pair::*;
