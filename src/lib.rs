@@ -30,3 +30,6 @@ pub mod exposure;
 
 pub mod spherical_pair;
     pub use spherical_pair::*;
+
+pub mod spherical_pair_grid;
+    pub use spherical_pair_grid::*;

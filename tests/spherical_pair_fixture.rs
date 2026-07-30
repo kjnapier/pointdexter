@@ -11,12 +11,21 @@
 //! does -- above all `mu`, which is compared to `Origin::SSB.mu()` bit-for-bit rather than to a
 //! transcribed literal.
 //!
-//! Coverage: the `cases`, `solve_h_cases`, `state_cases` and `gate_cases` blocks. The
-//! `grid_cases` and `ladder_case` blocks are the Stage 2 grid generator's oracle -- they are
-//! checked for presence here and consumed when `grid.py` is ported.
+//! Coverage: all six blocks. `cases`, `solve_h_cases`, `state_cases` and `gate_cases` gate
+//! Stage 1 (`spherical_pair.rs`); `grid_cases` and `ladder_case` gate Stage 2
+//! (`spherical_pair_grid.rs`, the port of ssolink's `kernels/spherical-pair/grid.py`).
+//!
+//! ⭐ The Stage 2 half is a *stricter* gate than the Stage 1 half, and the fixture says so: the
+//! levers and the ladder are pure arithmetic on frozen arrays -- no solver, no ephemeris -- so
+//! `lever_rel = 1e-12` there is a real requirement rather than a budget for a different
+//! universal-variable implementation.
 
 use nalgebra::Vector3;
 use pointdexter::spherical_pair::{gate_radius, h_max, radial_at, range_quadratic, Node, Pair, PairPoint, Solution};
+use pointdexter::spherical_pair_grid::{
+    binding_branch, build_ladder, gamma_cell, n_rdot_nodes, parallax_lever, rdot_cell, rdot_span,
+    summarize, zoom_lever, Geometry, GridNode, Stat,
+};
 use serde_json::Value;
 use spacerocks::coordinates::Origin;
 
@@ -440,12 +449,214 @@ fn the_gate_does_not_bound_sky_positions_except_at_integer_years() {
 
 // -------------------------------------------------------------------------- Stage 2's oracle
 
+/// A [`Geometry`] from a fixture `geometry` block. The window arrays are `ts`/`Es`/`us` and the
+/// anchors `t0`/`t1`/`E0`/`E1`/`u0`/`u1`, exactly as `grid.py`'s dataclass names them.
+fn geometry(v: &Value) -> Geometry {
+    let ts: Vec<f64> = v["ts"].as_array().expect("no ts").iter().map(f).collect();
+    let es: Vec<Vector3<f64>> = v["Es"].as_array().expect("no Es").iter().map(vec3).collect();
+    let us: Vec<Vector3<f64>> = v["us"].as_array().expect("no us").iter().map(vec3).collect();
+    Geometry::new(
+        f(&v["t0"]),
+        f(&v["t1"]),
+        vec3(&v["E0"]),
+        vec3(&v["E1"]),
+        vec3(&v["u0"]),
+        vec3(&v["u1"]),
+        ts,
+        es,
+        us,
+    )
+    .expect("fixture geometry is not self-consistent")
+}
+
 #[test]
-fn the_stage_2_blocks_are_present_and_deliberately_not_consumed_yet() {
-    // grid_cases / ladder_case gate the (r, rdot) grid generator (ssolink
-    // kernels/spherical-pair/grid.py). Asserting their presence keeps a schema bump that dropped
-    // them from looking like a pass; the levers themselves are Stage 2's gate.
+fn the_grid_levers_and_the_cell_they_set_reproduce_the_oracle() {
+    // The whole closed form, case by case: the two levers, the third (mean-motion) lever kept
+    // for the branch comparison, and the cell each of them sets.
     let d = doc();
-    assert!(!d["grid_cases"].as_array().unwrap().is_empty());
-    assert!(!d["ladder_case"]["nodes"].as_array().unwrap().is_empty());
+    let mu = f(&d["mu"]);
+    let lever_rel = tol(&d, "lever_rel");
+    let cases = d["grid_cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+
+    for c in cases {
+        let name = c["name"].as_str().unwrap();
+        let g = geometry(&c["geometry"]);
+        let eps = f(&c["eps_rad"]);
+
+        let w = parallax_lever(&g, Stat::Median);
+        let z = zoom_lever(&g, Stat::Median);
+        let t2 = pointdexter::spherical_pair_grid::meanmotion_lever(&g, Stat::Median);
+        assert!(rel_err(w, f(&c["levers"]["W"])) < lever_rel, "W on {name}");
+        assert!(rel_err(z, f(&c["levers"]["Z"])) < lever_rel, "Z on {name}");
+        assert!(rel_err(t2, f(&c["levers"]["T2"])) < lever_rel, "T2 on {name}");
+
+        let r = f(&c["cell"]["r"]);
+        let dgamma = gamma_cell(w, eps).unwrap();
+        let drdot = rdot_cell(r, z, eps).unwrap();
+        assert!(rel_err(dgamma, f(&c["cell"]["dgamma"])) < lever_rel, "dgamma on {name}");
+        assert!(rel_err(drdot, f(&c["cell"]["drdot"])) < lever_rel, "drdot on {name}");
+        assert!(
+            rel_err(rdot_span(r, mu), f(&c["cell"]["rdot_span"])) < lever_rel,
+            "rdot_span on {name}"
+        );
+        assert_eq!(
+            n_rdot_nodes(r, drdot, mu).unwrap(),
+            c["cell"]["n_rdot_nodes"].as_u64().unwrap() as usize,
+            "n_rdot_nodes on {name}"
+        );
+    }
+}
+
+#[test]
+fn parallax_sets_the_r_cell_in_every_recorded_case() {
+    // 🔴 The branch decision, gated rather than assumed. `ratio > 1` means the mean-motion
+    // tolerance is the looser one, so parallax binds and the grid variable is 1/r -- NOT the
+    // relative `r_max/r_min < r_tol` criterion of `grid.rs:251-278`, which is the mean-motion
+    // branch and is looser here by the ratio this test reproduces.
+    let d = doc();
+    let mu = f(&d["mu"]);
+    let lever_rel = tol(&d, "lever_rel");
+
+    for c in d["grid_cases"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let g = geometry(&c["geometry"]);
+        let want = &c["binding_branch"];
+        let got = binding_branch(&g, f(&want["r"]), f(&c["eps_rad"]), mu, Stat::Median).unwrap();
+
+        assert!(rel_err(got.parallax_rel, f(&want["parallax_rel"])) < lever_rel, "{name}");
+        assert!(rel_err(got.meanmotion_rel, f(&want["meanmotion_rel"])) < lever_rel, "{name}");
+        assert!(rel_err(got.ratio, f(&want["ratio"])) < lever_rel, "{name}");
+        assert_eq!(got.binds.as_str(), want["binds"].as_str().unwrap(), "{name}");
+        assert_eq!(got.binds.as_str(), "parallax", "mean motion bound on {name}");
+    }
+}
+
+#[test]
+fn the_c1_least_squares_projector_would_not_reproduce_these_levers() {
+    // 🔴 The porting mistake this module exists to prevent, pinned with a number instead of a
+    // comment. `tangent_v2.rs:515-520` detrends the window by least squares on {1, t}; C2's
+    // solve pins the direction EXACTLY at both anchors, so its projector is the affine function
+    // THROUGH them. The two are not close: the least-squares residual is smaller by up to 6.6x
+    // on this fixture -- and smaller W means a WIDER gamma cell, so a port that copied C1 would
+    // under-sample the grid by that factor while every test that only checked "is it positive"
+    // still passed.
+    let d = doc();
+    let mut worst = 1.0f64;
+    for c in d["grid_cases"].as_array().unwrap() {
+        let g = geometry(&c["geometry"]);
+        let n = g.ts.len() as f64;
+
+        // Least-squares fit of v(t) = a + b t over the window, by normal equations.
+        let (mut st, mut stt) = (0.0, 0.0);
+        let (mut sv, mut svt) = (Vector3::zeros(), Vector3::<f64>::zeros());
+        let perp: Vec<Vector3<f64>> = g
+            .es
+            .iter()
+            .zip(g.us.iter())
+            .map(|(e, u)| e - e.dot(u) * u)
+            .collect();
+        for (t, v) in g.ts.iter().zip(perp.iter()) {
+            st += t;
+            stt += t * t;
+            sv += *v;
+            svt += *v * *t;
+        }
+        let det = n * stt - st * st;
+        let b = (n * svt - st * sv) / det;
+        let a = (sv - b * st) / n;
+        let mut res: Vec<f64> = g
+            .ts
+            .iter()
+            .zip(perp.iter())
+            .map(|(t, v)| (v - (a + b * *t)).norm())
+            .collect();
+        res.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let k = res.len();
+        let lsq_w = 0.5 * (res[k / 2 - 1] + res[k / 2]);
+
+        let ratio = lsq_w / f(&c["levers"]["W"]);
+        assert!(ratio < 0.99, "the two projectors agree on {} -- test is not discriminating",
+                c["name"].as_str().unwrap());
+        worst = worst.min(ratio);
+    }
+    assert!(worst < 0.3, "the C1 projector's error should reach several-fold; worst was {worst}");
+}
+
+#[test]
+fn the_ladder_reproduces_the_oracle_node_by_node() {
+    let d = doc();
+    let mu = f(&d["mu"]);
+    let lever_rel = tol(&d, "lever_rel");
+    let l = &d["ladder_case"];
+
+    // 🔴 The recorded ladder was built with ONE geometry at every shell. Asserting the flag
+    // rather than trusting it keeps a future fixture that varies the geometry per shell -- which
+    // is what a real run does -- from being silently checked against a constant closure here.
+    assert_eq!(l["constant_geometry"], true);
+    let g = geometry(&l["geometry"]);
+
+    let got = build_ladder(
+        |_r| Ok(g.clone()),
+        f(&l["r_min"]),
+        f(&l["r_max"]),
+        f(&l["eps_rad"]),
+        mu,
+        Stat::Median,
+        100_000,
+    )
+    .expect("ladder failed to build");
+
+    let want = l["nodes"].as_array().unwrap();
+    assert_eq!(got.len(), want.len(), "node count differs");
+    for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(rel_err(a.r, f(&b["r"])) < lever_rel, "node {i} r");
+        assert!(rel_err(a.rdot, f(&b["rdot"])) < lever_rel, "node {i} rdot");
+        assert!(rel_err(a.dgamma, f(&b["dgamma"])) < lever_rel, "node {i} dgamma");
+        assert!(rel_err(a.drdot, f(&b["drdot"])) < lever_rel, "node {i} drdot");
+    }
+
+    // Order is part of the contract: shells march outward in gamma, so `r` comes out strictly
+    // decreasing and each shell's rdot nodes are contiguous.
+    assert!(got.windows(2).all(|w| w[0].r >= w[1].r));
+}
+
+#[test]
+fn the_ladder_summary_reproduces_and_the_collapse_is_a_suffix_property() {
+    let d = doc();
+    let mu = f(&d["mu"]);
+    let l = &d["ladder_case"];
+    let g = geometry(&l["geometry"]);
+    let ladder = build_ladder(
+        |_r| Ok(g.clone()),
+        f(&l["r_min"]),
+        f(&l["r_max"]),
+        f(&l["eps_rad"]),
+        mu,
+        Stat::Median,
+        100_000,
+    )
+    .unwrap();
+    let s = summarize(&ladder);
+    let want = &l["summary"];
+
+    assert_eq!(s.shells, want["shells"].as_u64().unwrap() as usize);
+    assert_eq!(s.nodes, want["nodes"].as_u64().unwrap() as usize);
+    assert_eq!(s.max_rdot_nodes, want["max_rdot_nodes"].as_u64().unwrap() as usize);
+    assert_eq!(s.single_rdot_shells, want["single_rdot_shells"].as_u64().unwrap() as usize);
+    assert!(rel_err(s.r_min.unwrap(), f(&want["r_min"])) < tol(&d, "lever_rel"));
+    assert!(rel_err(s.r_max.unwrap(), f(&want["r_max"])) < tol(&d, "lever_rel"));
+
+    // ⭐ The collapse distance is the figure worth quoting -- beyond it the whole BOUND rdot span
+    // fits in one cell, so the generator emits a single rdot = 0 node. Reproducing the number is
+    // not enough: check it is the property it claims to be.
+    let collapse = f(&want["collapse_au"]);
+    assert!(rel_err(s.collapse_au.unwrap(), collapse) < tol(&d, "lever_rel"));
+    let beyond: Vec<&GridNode> = ladder.iter().filter(|n| n.r >= collapse).collect();
+    let shells_beyond: std::collections::BTreeSet<u64> =
+        beyond.iter().map(|n| n.r.to_bits()).collect();
+    assert_eq!(beyond.len(), shells_beyond.len(), "a shell beyond the collapse has >1 rdot node");
+    assert!(beyond.iter().all(|n| n.rdot == 0.0), "a collapsed shell is not centred on rdot = 0");
+    // ...and that it is not vacuous: the axis really does open up inside it.
+    assert!(ladder.iter().any(|n| n.r < collapse && n.rdot != 0.0));
 }
