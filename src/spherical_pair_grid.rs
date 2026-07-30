@@ -760,6 +760,68 @@ mod tests {
     }
 
     #[test]
+    fn every_shell_is_sized_by_the_lever_at_its_own_r() {
+        // 🔴 The one mutation the oracle cannot see (`_mutate_c2_grid.py` M13): hoisting the lever
+        // evaluation out of the shell loop -- a plausible "optimization", since `W` carries no
+        // `r`. Every other ladder test here hands `build_ladder` a CONSTANT geometry
+        // (`|_r| Ok(g.clone())`) and the fixture's ladder case is recorded with
+        // `constant_geometry: true`, so all of them pass under the hoist. Re-sizing per shell is
+        // load-bearing: `W` drifts ~1.14x over 80-1600 AU and up to 2.5x with ecliptic latitude.
+        let g = geom();
+        // Synthetic, and r-dependent only so the re-evaluation is observable: a real caller's
+        // geometry moves with `r` through the trial object's own light-time and elongation.
+        let geom_at = |r: f64| -> Result<Geometry, GridError> {
+            let scale = 1.0 + 100.0 / r;
+            Geometry::new(
+                g.t0,
+                g.t1,
+                g.e0 * scale,
+                g.e1 * scale,
+                g.u0,
+                g.u1,
+                g.ts.clone(),
+                g.es.iter().map(|e| e * scale).collect(),
+                g.us.clone(),
+            )
+        };
+        let seen = std::cell::RefCell::new(Vec::<f64>::new());
+        let ladder = build_ladder(
+            |r| {
+                seen.borrow_mut().push(r);
+                geom_at(r)
+            },
+            200.0,
+            1600.0,
+            4.848e-5,
+            mu(),
+            Stat::Median,
+            100_000,
+        )
+        .unwrap();
+
+        let mut shells: Vec<f64> = Vec::new();
+        for nd in &ladder {
+            if shells.last() != Some(&nd.r) {
+                shells.push(nd.r);
+            }
+        }
+        // Called once per shell, at that shell's own r -- not at r_max, not at some hoisted r.
+        assert_eq!(*seen.borrow(), shells);
+        // And the cell each shell carries is the one its own geometry implies, re-derived here
+        // rather than compared shell-to-shell (which a hoist to r_min would also satisfy).
+        for nd in &ladder {
+            let g_r = geom_at(nd.r).unwrap();
+            assert_eq!(nd.w, parallax_lever(&g_r, Stat::Median));
+            assert_eq!(nd.z, zoom_lever(&g_r, Stat::Median));
+            assert_eq!(nd.dgamma, gamma_cell(nd.w, 4.848e-5).unwrap());
+        }
+        // Not a vacuous test: the lever really does move across this ladder.
+        let w_out = ladder.first().unwrap().w;
+        let w_in = ladder.last().unwrap().w;
+        assert!(w_in / w_out > 1.05, "levers barely move ({w_out} -> {w_in}); the test proves nothing");
+    }
+
+    #[test]
     fn a_runaway_ladder_errors_rather_than_returning_a_giant_grid() {
         // Far too many shells for the cap: the guard fires on the accumulated count.
         let g = geom();
