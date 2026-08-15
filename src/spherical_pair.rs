@@ -138,12 +138,12 @@ impl Solution {
 /// angle are used downstream, and both are invariant to that choice. Keeping it 2-D is what
 /// makes the swept angle signed for free (see [`swept_angle`]).
 #[derive(Debug, Clone, Copy)]
-struct CanonicalState {
-    pos: [f64; 2],
-    vel: [f64; 2],
+pub(crate) struct CanonicalState {
+    pub(crate) pos: [f64; 2],
+    pub(crate) vel: [f64; 2],
 }
 
-fn hypot2(v: [f64; 2]) -> f64 {
+pub(crate) fn hypot2(v: [f64; 2]) -> f64 {
     (v[0] * v[0] + v[1] * v[1]).sqrt()
 }
 
@@ -284,7 +284,7 @@ fn polish_anomaly(mut s: f64, node: &Node, alpha: f64, mu: f64, dt: f64) -> f64 
 /// This is the whole radial solve. `None` on any non-finite input or a solver that fails to
 /// bracket -- 🔴 which a caller must CLASSIFY rather than fold into "no solution": the solver's
 /// `Err` on bracketing is a different fact from `F` holding its sign.
-fn canonical_step(node: &Node, h: f64, dt: f64, mu: f64) -> Option<CanonicalState> {
+pub(crate) fn canonical_step(node: &Node, h: f64, dt: f64, mu: f64) -> Option<CanonicalState> {
     if !(node.r > 0.0) || !(h > 0.0) || !node.rdot.is_finite() || !dt.is_finite() || !(mu > 0.0) {
         return None;
     }
@@ -387,7 +387,7 @@ fn wrap_0_2pi(x: f64) -> f64 {
 /// The revolution count is exact, not estimated: a full period sweeps exactly `2*pi`, so the
 /// leftover always sweeps less than `2*pi`, and `floor(dt/T)` is the count. An unbound orbit
 /// sweeps less than `2*pi` in total, so there `T` does not exist and the count is zero.
-fn swept_angle(node: &Node, h: f64, mu: f64, s0: &CanonicalState, s1: &CanonicalState, dt: f64) -> f64 {
+pub(crate) fn swept_angle(node: &Node, h: f64, mu: f64, s0: &CanonicalState, s1: &CanonicalState, dt: f64) -> f64 {
     let phi0 = s0.pos[1].atan2(s0.pos[0]);
     let phi1 = s1.pos[1].atan2(s1.pos[0]);
     // h > 0 by construction, so motion is counter-clockwise and the sweep is positive.

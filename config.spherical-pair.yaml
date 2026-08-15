@@ -1,0 +1,119 @@
+# C2 spherical two-point search -- example configuration.
+#
+# A NEW file: `config.yaml` in this directory belongs to matt-0 and is not touched.
+#
+# Every value here replaces something the reference linker had baked into its source, or something
+# a C2 note measured. Each is annotated with which -- a config whose provenance is unrecorded is
+# how a run ends up described by parameters it did not use.
+
+frame:
+  # MJH: for TNO work the barycentre is the appropriate origin. NAMED, never numeric -- the code
+  # calls Origin::SSB.mu(); a transcribed literal 1.7e-11 away still fails the fixture by 0.067%.
+  origin: ssb
+
+search:
+  # Replaces the reference's baked 5 .. 1e5 AU band. This is the TNO band, where the measured
+  # survey cost is ~0.85 node-days on 118 cores.
+  r_min_au: 40.0
+  r_max_au: 60.0
+  # Grid budget. Visibly a choice, not a derivation: a p90-over-window variant moves node counts
+  # 1.6-3x and changes no scaling law.
+  eps_arcsec: 10.0
+  # Rubin needs 1-2 year spans, and reach is the cheapest knob in the method: ~103 emittable
+  # (r, rdot) nodes at a 1-yr reach against ~304 at 3-yr.
+  reach_days: 365.25
+  max_nodes: 100000
+
+gate:
+  # RESULT_c2_gate_ksigma.md. NOT optional and NOT defaulted: k = 0 reproduces the uncorrected
+  # gate, which put rho low by 2.6x (40 AU) to 6.3x (60 AU) -- and rho enters the pair count
+  # SQUARED.
+  k_sigma: 3.0
+  # Fallback ONLY. Rubin reports per-source raErr/decErr and those should be used; this is the
+  # measured median of the field the gate was calibrated on, for detections that carry none.
+  fallback_astrom_sigma_arcsec: 0.142
+
+anchor:
+  # An anchor is a PAIR OF DETECTIONS on one night (MJH, 2026-08-15); the support along the arc is
+  # single detections. 58.4% of position-nights get one visit and so yield no anchor -- that is an
+  # anchor-availability limit, not a completeness ceiling, because an object needs two anchorable
+  # epochs across its whole arc.
+  max_intra_night_hours: 12.0
+  # Replaces the reference's time_diff = 120.
+  max_anchor_baseline_days: 400.0
+  # Replaces the reference's chi2_thresh = 2.0. 9.488 is 95% of chi2_4, which is the dof of a
+  # tracklet-x-tracklet pair (8 coordinates, 4 consumed). Measured rejection: 0.88 of chance at
+  # Rubin's typical ~0.6 h anchor baseline, 0.997 at 6 h -- but the survey supplies a 6 h baseline
+  # on only 2.3% of tracklet-forming position-nights, so 0.88 is the operating point.
+  chi2_max: 9.488
+
+extension:
+  # NOT a free parameter: it is the grid cell. A node offset of half a cell (delta r/r = 0.32% at
+  # 40 AU) already displaces the prediction by ~4.3" over a year-long anchor span, where anchor
+  # astrometry alone would allow ~0.15". Gather loose, refit, re-gather tight.
+  tolerance_arcsec: 10.0
+  # A floor only, and keep it LOW -- the score is what discriminates. Demonstrated on the
+  # end-to-end synthetic run: with min_support = 3 a real object that had only 2 opportunities and
+  # was found at BOTH of them (p_chance = 9.8e-5, i.e. 100x past the threshold) was thrown away by
+  # the floor. It was penalised for having had fewer chances, which is the exact failure the
+  # opportunity normalisation exists to prevent.
+  # A raw count also does not travel between fields: chance support scales as
+  # n_opportunities * rho_det * pi * tol^2, so 3 detections is a 1.75% chance rate over 12 support
+  # epochs and a ~44% chance rate over 100.
+  min_support: 1
+  # The discriminant that does travel. At matched recall this rejects 96.9-98.5% of chance against
+  # 83.5-89.2% for a raw count -- 3-7x fewer survivors.
+  # TODO(stage 4): the chance count is over-dispersed (var/mean 1.3 at 3" rising to 9.2 at 30"),
+  # so a bare Poisson tail is optimistic by up to ~4x. Calibrate a negative-binomial tail before
+  # this threshold is trusted quantitatively.
+  max_chance_probability: 0.01
+  # 🔴 var/mean of the chance support count. 1.0 is Poisson and is optimistic in the
+  # tail by up to ~4x; measured 1.3 at a 3" gather rising to 9.2 at 30".
+  chance_dispersion: 1.3
+  # Support on the anchors' own nights is nearly free -- over hours every orbit through the two
+  # anchor detections predicts nearly the same position -- and the shift control endorses it.
+  # It confirms the detection, not the orbit.
+  exclude_anchor_nights: true
+
+data:
+  # 🔴 Which column is authoritative, stated rather than searched for. The loader converts
+  # `ast_ucty` from arcsec to radians but leaves `ra_ucty`/`dec_ucty` RAW -- reading those as
+  # radians is a 206265x error that lands in both the gate width and the chi2 denominator, i.e.
+  # it looks like a beautifully tight gate. Rubin reports per-source raErr/decErr; a synthesised
+  # astrom_sig = 0.805/SNR is NOT Rubin's sigma.
+  sigma_source: ast
+  # Only for `radec`. Not guessable from the data; worth a factor of 2 on one axis at |dec| = 60.
+  sigma_ra_includes_cos_dec: true
+  # Only for `fixed`.
+  sigma_fixed_arcsec: 0.142
+  # An exact float epoch is not a key: one exposure's detections can differ in the last bits, and
+  # a differently-rounded pipeline can be seconds off. 5 s, not 60 -- a window wider than a real
+  # time-scale offset silently joins things that are not the same exposure.
+  visit_tolerance_seconds: 5.0
+  # `floor(mjd - 0.5)`: the noon boundary keeps a night together across midnight UT, where a
+  # midnight boundary would split a two-visit night into two single-visit nights that form no
+  # anchor at all. ⚠️ A FALLBACK -- where the input carries the survey's own dayObs, use that.
+  night_boundary_days: 0.5
+  # High, never the median: the shared KD query must admit everything the exact per-pair gate
+  # might keep, and the exact test then rejects the rest.
+  sigma_cap_percentile: 0.975
+  # 🔴 Required acknowledgement, not a formality. The loader's obs_x/obs_y/obs_z path applies NO
+  # frame check; C2 asserts Origin::SSB.mu(), so a heliocentric observer is a frame error.
+  observer_positions_are_barycentric: true
+  # 🔴 A STOPGAP. The sized (r, rdot) ladder is a closed form evaluated from the run's own cadence
+  # and elongation coverage (spherical_pair_grid::build_ladder); wiring that driver is the next
+  # step. An explicit list is honest about not having it -- emitting a uniform grid here would
+  # look like the sized one and would not be.
+  explicit_nodes:
+    - r_au: 42.75
+      rdot_au_per_day: 0.0
+
+io:
+  detections: /path/to/detections.csv
+  output: /path/to/candidates.csv
+  # Optional: needed only when the catalogue identifies the observer by `obscode`. A catalogue
+  # carrying obs_x/obs_y/obs_z needs no kernel.
+  # spice_path: /path/to/spice
+  # Either works -- C2's geometry is vectors -- provided rho_hat and the observer are on the same
+  # plane, which the loader guarantees by rotating both together.
+  reference_plane: equatorial
