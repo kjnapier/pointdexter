@@ -34,11 +34,14 @@ use spacerocks::coordinates::Origin;
 use spacerocks::SpiceKernel;
 
 use pointdexter::io::load_detections::load_detections;
-use pointdexter::spherical_pair::{Node, gate_radius};
+use pointdexter::spherical_pair::{Node, gate_radius, range_quadratic};
 use pointdexter::spherical_pair_anchor::{Anchor, anchor_pairs_and_solve, build_anchors};
 use pointdexter::spherical_pair_extend::{ExtendParams, VisitIndex, extend_candidate};
 use pointdexter::spherical_pair_index::{
     BaryIndex, angle_of_chord, chord_of_angle, gate_radius_astrometric, pair_within_gate,
+};
+use pointdexter::spherical_pair_grid::{
+    Geometry, GridError, Stat, build_ladder, summarize,
 };
 use pointdexter::spherical_pair_load::{ObsSet, SigmaSource};
 
@@ -62,6 +65,12 @@ struct Cli {
     /// Load the configured detections and run stages 2-3: anchors, anchor pairs, solve, chi2 vet.
     #[arg(long)]
     run: bool,
+
+    /// Size the (r, rdot) ladder from this run's geometry, print its shape, and exit. Sizing is
+    /// cheap; the search that follows is not, so the grid a config implies should be inspectable
+    /// without paying for a run to find out.
+    #[arg(long)]
+    ladder_only: bool,
 }
 
 /// Which origin the frame and `mu` are taken from. Named, never numeric.
@@ -103,6 +112,14 @@ struct Search {
     /// 3 yr needs ~304 -- so it is configuration, not a constant.
     reach_days: f64,
     max_nodes: usize,
+    /// Which statistic of the anchored residual sets the lever: "median" or "p90".
+    ///
+    /// 🔴 A POLICY, not a fact -- how much of the extension window the cell must hold to `eps`
+    /// (`spherical_pair_grid::Stat`). It is in the config precisely because hardcoding it makes
+    /// the policy invisible, and the residual is identically ZERO at both anchors: a median over
+    /// a window whose epochs cluster near an anchor reports the lever far too small, the cell far
+    /// too large, and the grid quietly stops covering.
+    lever_stat: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,11 +217,156 @@ struct Data {
     /// origin move together. Setting this false refuses to run rather than producing a silently
     /// heliocentric search.
     observer_positions_are_barycentric: bool,
-    /// Nodes to search. 🔴 A stopgap: the sized `(r, rdot)` ladder is a closed form evaluated from
-    /// the run's OWN cadence and elongation coverage (`spherical_pair_grid::build_ladder`), and
-    /// wiring that driver is the next stage. An explicit list is honest about not having it;
-    /// emitting a uniform grid here would look like the sized one and would not be.
+    /// OPTIONAL override. Leave empty (the default) and the run sizes its own `(r, rdot)` ladder
+    /// from its OWN cadence and elongation coverage via `spherical_pair_grid::build_ladder`.
+    ///
+    /// 🔴 An explicit list is a DIAGNOSTIC, not a search. Placing nodes by hand around an answer
+    /// you already know measures whether the chain can recover an object it was pointed at; it
+    /// does not measure whether the chain can find one. Both are useful and they are not the
+    /// same claim, so a run that sets this says so loudly in its banner.
+    #[serde(default)]
     explicit_nodes: Vec<NodeSpec>,
+}
+
+/// The [`Geometry`] the ladder sizes itself from: this run's own cadence and pointing.
+///
+/// Three choices, each of which changes the cell and so is stated rather than buried:
+///
+/// * **`t0`/`t1` are the WIDEST anchor baseline the run can form**, not a typical one. The
+///   projector is the affine function through the two anchors and is identically zero there, so
+///   the unabsorbed residual -- and with it the lever -- grows with the baseline. Sizing on a
+///   short baseline would emit a grid too coarse for the long pairs the same run will search.
+///   The widest baseline gives the tightest cell, which is the conservative direction.
+/// * **The line of sight is the region's mean `rho_hat`**, not a per-epoch object track. `W` is
+///   direction-dependent but orbit-free, and the exported region is ~1 deg across, so one
+///   direction sizes the whole region. 🔴 This is what makes the ladder per-REGION; a run
+///   spanning many degrees of ecliptic latitude must ladder per band and concatenate.
+/// * **One entry per VISIT**, not per detection: the extension window is a cadence, and
+///   weighting it by detection count would let one crowded visit set the grid.
+struct RunCadence {
+    ts: Vec<f64>,
+    es: Vec<Vector3<f64>>,
+    u: Vector3<f64>,
+    t0: f64,
+    t1: f64,
+    e0: Vector3<f64>,
+    e1: Vector3<f64>,
+}
+
+fn run_cadence(
+    set: &ObsSet,
+    visits: &[Vec<usize>],
+    night_keys: &[i64],
+    nights: &std::collections::BTreeMap<i64, Vec<usize>>,
+) -> Result<RunCadence, String> {
+    if night_keys.len() < 2 {
+        return Err("ladder needs at least two nights to define an anchor baseline".into());
+    }
+    let mut u_sum = Vector3::zeros();
+    let (mut ts, mut es) = (Vec::new(), Vec::new());
+    for v in visits.iter() {
+        let o = &set.obs[v[0]];
+        ts.push(o.epoch);
+        es.push(o.observer);
+        u_sum += v.iter().fold(Vector3::zeros(), |a, &i| a + set.obs[i].rho_hat);
+    }
+    let first = nights[&night_keys[0]][0];
+    let last = *nights[night_keys.last().expect("night_keys non-empty")]
+        .last()
+        .expect("a night has visits");
+    let (a, b) = (&set.obs[visits[first][0]], &set.obs[visits[last][0]]);
+    Ok(RunCadence {
+        ts,
+        es,
+        u: u_sum.normalize(),
+        t0: a.epoch,
+        t1: b.epoch,
+        e0: a.observer,
+        e1: b.observer,
+    })
+}
+
+/// The sky track of ONE trial orbit at distance `r`, over this run's cadence.
+///
+/// `vr`/`vo` are the radial and transverse speeds at `t0`; the transverse direction is `az`
+/// radians around the line of sight. Propagation is the crate's own f-and-g
+/// ([`InitialCondition3D`]), not a series expansion -- the lever is precisely the part of the
+/// signature that SURVIVES removing an affine, so a quadratic-truncated track would approximate
+/// the very term being measured.
+fn trial_geometry(cad: &RunCadence, r: f64, vr: f64, vo: f64, az: f64, mu: f64)
+    -> Result<Geometry, String>
+{
+    let p0 = range_quadratic(&cad.e0, &cad.u, r)
+        .ok_or_else(|| format!("no line-of-sight point at r={r}"))?;
+    let rhat = p0.normalize();
+    // a transverse basis perpendicular to the heliocentric radius
+    let mut a = rhat.cross(&Vector3::z());
+    if a.norm() < 1e-8 {
+        a = rhat.cross(&Vector3::x());
+    }
+    let a = a.normalize();
+    let b = rhat.cross(&a);
+    let that = a * az.cos() + b * az.sin();
+    let v0 = rhat * vr + that * vo;
+
+    let ic = pointdexter::initial_condition_3d::InitialCondition3D::from_spherical(
+        "trial".into(), r, vr, vo, spacerocks::Time::new(cad.t0, "tdb", "jd")
+            .map_err(|e| format!("trial epoch: {e}"))?, mu,
+    ).map_err(|e| format!("trial orbit: {e}"))?;
+
+    let mut us = Vec::with_capacity(cad.ts.len());
+    for (t, e) in cad.ts.iter().zip(cad.es.iter()) {
+        let (f, g) = ic.fg_at_epoch(*t);
+        let p = p0 * f + v0 * g;
+        let geo = p - e;
+        let n = geo.norm();
+        if !(n > 0.0) {
+            return Err("trial track passed through the observer".into());
+        }
+        us.push(geo / n);
+    }
+    let u_at = |t: f64, e: &Vector3<f64>| {
+        let (f, g) = ic.fg_at_epoch(t);
+        (p0 * f + v0 * g - e).normalize()
+    };
+    Geometry::new(
+        cad.t0, cad.t1, cad.e0, cad.e1,
+        u_at(cad.t0, &cad.e0), u_at(cad.t1, &cad.e1),
+        cad.ts.clone(), cad.es.clone(), us,
+    )
+    .map_err(|e: GridError| format!("trial geometry: {e:?}"))
+}
+
+/// The trial geometry that sizes shell `r`: the TIGHTEST cell anywhere in the bound domain.
+///
+/// 🔴 MJH, 2026-08-16: these runs must cover orbits up to the bound limit. `rdot_span` already
+/// makes the ṙ *range* the full escape width `2*sqrt(2mu/r)`. This makes the ṙ *cell* match: the
+/// zoom lever Z depends on `r` through the sky track and "must be measured per shell, not
+/// hardcoded as an exponent" (`spherical_pair_grid::zoom_lever`), and a track is only fixed once
+/// the velocity is. So sample the bound velocity domain `vr^2 + vo^2 <= 2mu/r` and keep the
+/// sample with the LARGEST Z, i.e. the smallest `drdot`. Sizing on any interior sample would
+/// emit a grid too coarse for part of the span it claims to cover.
+fn geometry_for_shell(cad: &RunCadence, r: f64, mu: f64) -> Result<Geometry, GridError> {
+    let v_esc = (2.0 * mu / r).sqrt();
+    let mut best: Option<(f64, Geometry)> = None;
+    for &fv in &[0.25_f64, 0.5, 0.75, 1.0] {
+        for &fr in &[0.0_f64, 0.5, 0.9] {
+            let vr = fr * fv * v_esc;
+            let vo = ((fv * v_esc).powi(2) - vr * vr).max(0.0).sqrt();
+            for k in 0..4 {
+                let az = std::f64::consts::FRAC_PI_2 * k as f64;
+                if let Ok(g) = trial_geometry(cad, r, vr, vo, az, mu) {
+                    let z = pointdexter::spherical_pair_grid::zoom_lever(&g, Stat::Median).abs();
+                    if z.is_finite() && best.as_ref().is_none_or(|(bz, _)| z > *bz) {
+                        best = Some((z, g));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, g)| g).ok_or_else(|| {
+        GridError::DegenerateGeometry(format!("no usable trial track at r={r}"))
+    })
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -397,7 +559,7 @@ fn self_check(cfg: &Config) {
 }
 
 /// Load detections, group them, and run stage 3 for each configured node.
-fn run_search(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn run_search(cfg: &Config, ladder_only: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mu = cfg.frame.origin.mu();
     let mut kernel = SpiceKernel::new();
     if let Some(sp) = &cfg.io.spice_path {
@@ -476,7 +638,76 @@ fn run_search(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "accepted", "epoch", "h", "x", "y", "z", "vx", "vy", "vz",
     ])?;
 
-    for spec in &cfg.data.explicit_nodes {
+    // ---- the (r, rdot) node set -------------------------------------------------------------
+    let specs: Vec<(NodeSpec, f64)> = if cfg.data.explicit_nodes.is_empty() {
+        let cad = run_cadence(&set, &visits, &night_keys, &nights)?;
+        let stat = match cfg.search.lever_stat.as_str() {
+            "median" => Stat::Median,
+            "p90" => Stat::P90,
+            other => return Err(format!("search.lever_stat must be median|p90; got {other}").into()),
+        };
+        let eps_rad = cfg.search.eps_arcsec * ARCSEC;
+        let nodes = build_ladder(
+            |r| geometry_for_shell(&cad, r, mu),
+            cfg.search.r_min_au,
+            cfg.search.r_max_au,
+            eps_rad,
+            mu,
+            stat,
+            cfg.search.max_nodes,
+        )
+        .map_err(|e| format!("ladder: {e:?}"))?;
+        let s = summarize(&nodes);
+        println!(
+            "  LADDER sized from this run's own geometry: {} shells, {} nodes over {:.1}-{:.1} AU\
+             \n    anchor baseline {:.1} d, extension window {} epochs, eps {:.1}\"\
+             \n    rdot nodes per shell: max {}, single on {} shells{}",
+            s.shells,
+            s.nodes,
+            s.r_min.unwrap_or(f64::NAN),
+            s.r_max.unwrap_or(f64::NAN),
+            (cad.t1 - cad.t0).abs(),
+            cad.ts.len(),
+            cfg.search.eps_arcsec,
+            s.max_rdot_nodes,
+            s.single_rdot_shells,
+            match s.collapse_au {
+                Some(r) => format!(", rdot axis collapses beyond {r:.1} AU"),
+                None => String::new(),
+            }
+        );
+        if let Some(n0) = nodes.first() {
+            println!(
+                "    levers ({}): W = {:.4} AU, Z = {:.4} rad.d  =>  half-cell dgamma {:.3e} \
+                 (dr/r {:.2}% at {:.1} AU), drdot {:.3e}",
+                cfg.search.lever_stat, n0.w, n0.z, n0.dgamma,
+                100.0 * n0.dgamma * n0.r, n0.r, n0.drdot,
+            );
+        }
+        if ladder_only {
+            return Ok(());
+        }
+        // 🔴 Carry the cell's LOWER r edge alongside the node. `build_ladder` emits r = 1/gamma
+        // at the cell's lower GAMMA edge, i.e. its LARGEST r -- the value that makes the pairing
+        // gate smallest, where the cell needs the gate that bounds its fastest (smallest-r)
+        // member. See build_anchors.
+        nodes
+            .iter()
+            .map(|n| (NodeSpec { r_au: n.r, rdot_au_per_day: n.rdot },
+                      1.0 / (1.0 / n.r + 2.0 * n.dgamma)))
+            .collect()
+    } else {
+        println!(
+            "  🔴 EXPLICIT NODES ({} of them): this is a DIAGNOSTIC, not a search. The ladder is \
+             bypassed, so recall here means 'recovered when pointed at', not 'found'.",
+            cfg.data.explicit_nodes.len()
+        );
+        // An explicit node has no cell, so assert and bound coincide -- which is exactly why
+        // this defect stayed invisible for as long as every run used hand-placed nodes.
+        cfg.data.explicit_nodes.iter().map(|n| (*n, n.r_au)).collect()
+    };
+
+    for (spec, r_gate_lower) in &specs {
         let node = Node { r: spec.r_au, rdot: spec.rdot_au_per_day };
         // anchors per night: every visit pair inside the configured intra-night span
         let mut per_night: Vec<(i64, Vec<Anchor>)> = Vec::new();
@@ -491,7 +722,7 @@ fn run_search(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     anchors.extend(build_anchors(
-                        &set.obs, va, vb, spec.r_au, cfg.gate.k_sigma, mu, cap,
+                        &set.obs, va, vb, spec.r_au, *r_gate_lower, cfg.gate.k_sigma, mu, cap,
                     ));
                 }
             }
@@ -614,13 +845,13 @@ fn main() {
     if cli.self_check {
         self_check(&cfg);
     }
-    if cli.run {
-        if let Err(e) = run_search(&cfg) {
+    if cli.run || cli.ladder_only {
+        if let Err(e) = run_search(&cfg, cli.ladder_only) {
             eprintln!("run failed: {e}");
             std::process::exit(1);
         }
     }
-    if !cli.print_config && !cli.self_check && !cli.run {
+    if !cli.print_config && !cli.self_check && !cli.run && !cli.ladder_only {
         println!(
             "nothing to do: stage 0 validates configuration and can --self-check.\n\
              the search itself arrives with stage 3 (detections) and stage 4 (extension)."

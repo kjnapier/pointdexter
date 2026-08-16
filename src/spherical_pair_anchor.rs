@@ -94,11 +94,26 @@ pub struct Anchor {
 /// The KD query uses a population-wide `sigma_cap` so one tree serves every pair; the exact
 /// per-pair gate is then re-applied, so the cap only ever admits extra candidates for the exact
 /// test to reject. 🔴 That order matters: capping *after* would silently drop true pairs.
+/// 🔴 TWO r's, and they are not the same number (split 2026-08-16).
+///
+/// * `r_assert` is the HYPOTHESIS: the distance at which the detections are placed to make them
+///   barycentric. It is the node's own r.
+/// * `r_gate_lower` is a BOUND over the node's cell: `gate_radius ~ r^-3/2`, so the pairing
+///   radius must be evaluated at the cell's SMALLEST r, whose members move fastest. That is what
+///   `gate_radius`'s "the lower edge is exact where a centre value needs a 2.8x blind pad" means.
+///
+/// One parameter served both until the sized ladder was wired, and with hand-placed nodes that
+/// was invisible -- an explicit node has no cell, so the two coincide. The ladder emits
+/// `r = 1/gamma` at the cell's LOWER gamma edge, i.e. its LARGEST r, which is the value that
+/// makes the gate smallest. At a 56%-wide cell that under-sizes the pairing radius by ~3x and
+/// the object's own anchors are never proposed. Under-admission is invisible downstream by
+/// construction: nothing can observe a pair that was not offered.
 pub fn build_anchors(
     obs: &[Obs],
     visit_a: &[usize],
     visit_b: &[usize],
-    r_lower_edge: f64,
+    r_assert: f64,
+    r_gate_lower: f64,
     k: f64,
     mu: f64,
     sigma_cap: f64,
@@ -114,14 +129,14 @@ pub fn build_anchors(
         let o: Vec<Vector3<f64>> = v.iter().map(|&i| obs[i].observer).collect();
         let u: Vec<Vector3<f64>> = v.iter().map(|&i| obs[i].rho_hat).collect();
         let ids: Vec<u32> = (0..v.len() as u32).collect();
-        BaryIndex::build(&o, &u, &ids, r_lower_edge)
+        BaryIndex::build(&o, &u, &ids, r_assert)
     };
     let ia = pack(visit_a);
     let ib = pack(visit_b);
     if ia.is_empty() || ib.is_empty() {
         return Vec::new();
     }
-    let cap = gate_radius_astrometric(r_lower_edge, dt, mu, sigma_cap, k);
+    let cap = gate_radius_astrometric(r_gate_lower, dt, mu, sigma_cap, k);
 
     let mut out = Vec::new();
     for (slot_a, p) in ia.points.iter().enumerate() {
@@ -131,7 +146,7 @@ pub fn build_anchors(
             let j = visit_b[ib.ids[slot_b] as usize];
             // the exact per-pair gate: this pair's own sigmas, in quadrature
             let sq = (obs[i].sigma * obs[i].sigma + obs[j].sigma * obs[j].sigma).sqrt();
-            let exact = gate_radius_astrometric(r_lower_edge, dt, mu, sq, k);
+            let exact = gate_radius_astrometric(r_gate_lower, dt, mu, sq, k);
             let b = Vector3::new(ib.points[slot_b][0], ib.points[slot_b][1], ib.points[slot_b][2]);
             let sep = crate::spherical_pair_index::angle_of_chord((q - b).norm());
             if sep > exact {
@@ -525,7 +540,7 @@ mod tests {
         let (_t, obs) = synth(&epochs(), 45.0, -1.0e-4, 0.12 / 206_264.806_247_096_36);
         let sigma_cap = obs[0].sigma * std::f64::consts::SQRT_2;
         // supply the LATER visit first
-        let anchors = build_anchors(&obs, &[1], &[0], 45.0, 3.0, mu(), sigma_cap);
+        let anchors = build_anchors(&obs, &[1], &[0], 45.0, 45.0, 3.0, mu(), sigma_cap);
         assert!(!anchors.is_empty(), "the object's own two detections must pair");
         for a in &anchors {
             assert!(
