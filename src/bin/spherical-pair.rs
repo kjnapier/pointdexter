@@ -190,9 +190,11 @@ struct Data {
     /// Night boundary offset from the JD tick; 0.5 is the `floor(mjd - 0.5)` noon convention.
     /// ⚠️ A fallback. Where the input carries the survey's own `dayObs`, group on that instead.
     night_boundary_days: f64,
-    /// Percentile of the sigma distribution used to size the shared KD query. High, not median:
-    /// the cap must admit everything the exact per-pair gate might keep.
-    sigma_cap_percentile: f64,
+    // 🔴 `sigma_cap_percentile` was REMOVED 2026-08-16. The shared KD query is now sized on
+    // `sqrt(2) * max(sigma)`, a strict bound on every pair's quadrature, so there is no
+    // percentile left to choose. The field is deliberately NOT accepted-and-ignored: this
+    // struct is `deny_unknown_fields`, so an old config fails loudly rather than describing a
+    // run by a parameter it did not use. See ObsSet::sigma_cap.
     /// 🔴 Required acknowledgement. The loader's `obs_x/obs_y/obs_z` path takes the observer
     /// position from the file with NO frame check; C2 needs it BARYCENTRIC, because mu and the
     /// origin move together. Setting this false refuses to run rather than producing a silently
@@ -271,13 +273,6 @@ impl Config {
         }
         pos("data.visit_tolerance_seconds", self.data.visit_tolerance_seconds)?;
         pos("data.sigma_fixed_arcsec", self.data.sigma_fixed_arcsec)?;
-        let q = self.data.sigma_cap_percentile;
-        if !(q > 0.5 && q <= 1.0) {
-            return Err(format!(
-                "data.sigma_cap_percentile must be in (0.5,1]; got {q}. A cap at or below the \
-                 median drops true pairs whose own sigmas exceed it, and nothing downstream sees it."
-            ));
-        }
         if !self.data.observer_positions_are_barycentric {
             return Err(
                 "data.observer_positions_are_barycentric is false: C2 asserts Origin::SSB.mu(), \
@@ -445,16 +440,15 @@ fn run_search(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let visits = set.visits(cfg.data.visit_tolerance_seconds);
     let nights = set.nights(&visits, cfg.data.night_boundary_days);
-    let cap = set.sigma_cap(cfg.data.sigma_cap_percentile);
+    let cap = set.sigma_cap();
     let anchor_capable = nights.values().filter(|v| v.len() >= 2).count();
     println!(
         "  {} visits over {} nights ({} with >=2 visits, so able to form an anchor); \
-         sigma cap {:.4}\" at p{:.1}",
+         sigma cap {:.4}\" = sqrt(2) * max (strict)",
         visits.len(),
         nights.len(),
         anchor_capable,
         cap / ARCSEC,
-        100.0 * cfg.data.sigma_cap_percentile
     );
 
     let night_keys: Vec<i64> = nights.keys().copied().collect();

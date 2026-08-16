@@ -94,9 +94,11 @@ data:
   # midnight boundary would split a two-visit night into two single-visit nights that form no
   # anchor at all. ⚠️ A FALLBACK -- where the input carries the survey's own dayObs, use that.
   night_boundary_days: 0.5
-  # High, never the median: the shared KD query must admit everything the exact per-pair gate
-  # might keep, and the exact test then rejects the rest.
-  sigma_cap_percentile: 0.975
+  # 🔴 `sigma_cap_percentile` REMOVED 2026-08-16. The KD query is sized on sqrt(2)*max(sigma), a
+  # strict bound on every pair's quadrature. A percentile cannot bound a quadrature -- pairs whose
+  # BOTH sigmas exceed it escape -- which is the defect RESULT_c2_kdcap_correction.md found on the
+  # Python side. This struct is deny_unknown_fields, so a config still naming the percentile fails
+  # loudly rather than describing a run by a parameter it did not use.
   # 🔴 Required acknowledgement, not a formality. The loader's obs_x/obs_y/obs_z path applies NO
   # frame check; C2 asserts Origin::SSB.mu(), so a heliocentric observer is a frame error.
   observer_positions_are_barycentric: true

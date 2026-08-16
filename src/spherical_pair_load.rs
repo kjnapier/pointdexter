@@ -158,18 +158,32 @@ impl ObsSet {
 
     /// The population sigma used to size a KD query so one tree serves every pair.
     ///
-    /// The high percentile, not the median: the cap must admit every pair the exact per-pair gate
-    /// might keep, and the exact test then rejects the rest. Sizing on the median would drop true
-    /// pairs whose own sigmas are above it, which nothing downstream could observe.
-    pub fn sigma_cap(&self, percentile: f64) -> f64 {
-        if self.obs.is_empty() {
-            return 0.0;
-        }
-        let mut s: Vec<f64> = self.obs.iter().map(|o| o.sigma).collect();
-        s.sort_by(f64::total_cmp);
-        let idx = ((percentile.clamp(0.0, 1.0) * (s.len() - 1) as f64).round() as usize).min(s.len() - 1);
-        // two detections enter a pair, so the pair's quadrature sigma is sqrt(2) times one
-        s[idx] * std::f64::consts::SQRT_2
+    /// The cap must admit every pair the exact per-pair gate might keep, and the exact test then
+    /// rejects the rest. Under-admission is invisible by construction: nothing downstream can
+    /// observe a pair that was never proposed.
+    ///
+    /// 🔴 A PERCENTILE CANNOT BOUND A QUADRATURE, and this took `sqrt(2) * p97.5` until
+    /// 2026-08-16. A pair's sigma is `sqrt(s_i^2 + s_j^2)`; bounding it by `sqrt(2) * s_q`
+    /// requires BOTH `s_i` and `s_j` to be at or below `s_q`, and at q = 0.975 that fails for
+    /// ~0.06% of pairs -- the pairs with the two widest sigmas, which are exactly the wide,
+    /// high-rate, disproportionately chance pairs the gate finds easiest. Dropping them
+    /// FLATTERS the gate: `RESULT_c2_kdcap_correction.md` found the same defect on the Python
+    /// side (there capping on ONE detection's sigma, 1234 tracklets against 1318) and its
+    /// corrected numbers moved UPWARD.
+    ///
+    /// `sqrt(2) * max` is strict: for any pair, `sqrt(s_i^2 + s_j^2) <= sqrt(2) * max(s)`. The
+    /// note measured the cost of being strict on real Rubin sky at 1.1% in radius and 2% in
+    /// area, against a sigma distribution tight enough that there was never a speed argument
+    /// for the percentile.
+    pub fn sigma_cap(&self) -> f64 {
+        // NaN-safe: `total_cmp` orders NaN above every real value, so a NaN sigma would become
+        // the max and blow the cap open. Filter rather than sort.
+        self.obs
+            .iter()
+            .map(|o| o.sigma)
+            .filter(|s| s.is_finite())
+            .fold(0.0_f64, f64::max)
+            * std::f64::consts::SQRT_2
     }
 }
 
@@ -293,17 +307,48 @@ mod tests {
     }
 
     #[test]
-    fn the_sigma_cap_is_a_high_percentile_and_carries_the_pair_factor() {
+    fn the_sigma_cap_strictly_bounds_every_pair_quadrature() {
         let mut ds = Vec::new();
         for i in 0..100 {
             ds.push(det(2_460_000.5, Some((0.05 + 0.001 * i as f64) * ARCSEC), None, None));
         }
         let set = ObsSet::from_detections(&ds, SigmaSource::Ast);
-        let cap = set.sigma_cap(0.975);
-        let median = set.sigma_cap(0.5);
-        assert!(cap > median, "the cap must sit above the median, not at it");
-        // sqrt(2) for the two detections entering a pair
+        let cap = set.sigma_cap();
+        let smax = (0.05 + 0.001 * 99.0) * ARCSEC;
+        assert!((cap / (smax * std::f64::consts::SQRT_2) - 1.0).abs() < 1e-12);
+
+        // 🔴 The property the old p97.5 form did NOT have. Every pair, including the two widest
+        // together, must fall inside the cap -- that pair is precisely the one a percentile
+        // misses, and it is a wide, high-rate, disproportionately chance pair.
+        let s: Vec<f64> = set.obs.iter().map(|o| o.sigma).collect();
+        for i in 0..s.len() {
+            for j in 0..s.len() {
+                assert!(
+                    (s[i] * s[i] + s[j] * s[j]).sqrt() <= cap * (1.0 + 1e-12),
+                    "pair ({i},{j}) escapes the cap"
+                );
+            }
+        }
+        // and the superseded percentile form would have failed exactly that
         let p975 = (0.05 + 0.001 * 97.0) * ARCSEC;
-        assert!((cap / (p975 * std::f64::consts::SQRT_2) - 1.0).abs() < 1e-9);
+        let old_cap = p975 * std::f64::consts::SQRT_2;
+        assert!(
+            (smax * smax + smax * smax).sqrt() > old_cap,
+            "regression guard: the p97.5 cap must be shown to miss the widest pair"
+        );
+    }
+
+    #[test]
+    fn a_nan_sigma_cannot_blow_the_cap_open() {
+        // total_cmp orders NaN above every real value, so a max taken by sorting would return
+        // NaN and the cap would admit the whole sky.
+        let ds = vec![
+            det(2_460_000.5, Some(0.10 * ARCSEC), None, None),
+            det(2_460_000.5, Some(f64::NAN), None, None),
+            det(2_460_000.5, Some(0.20 * ARCSEC), None, None),
+        ];
+        let set = ObsSet::from_detections(&ds, SigmaSource::Ast);
+        let cap = set.sigma_cap();
+        assert!(cap.is_finite(), "a NaN sigma must not reach the cap");
     }
 }
