@@ -403,7 +403,79 @@ pub(crate) fn swept_angle(node: &Node, h: f64, mu: f64, s0: &CanonicalState, s1:
     partial
 }
 
+/// The scan grid `solve_h` walks, geometric in `h/h_max`.
+///
+/// 🔴 Extracted so that a diagnostic which re-walks the scan CANNOT silently drift from the scan
+/// the solver actually uses. A census taken on a grid that is not this one measures nothing.
+fn h_scan_grid(h_max: f64) -> impl Iterator<Item = f64> {
+    let ln_lo = H_SCAN_LO_FRAC.ln();
+    let ln_hi = H_SCAN_HI_FRAC.ln();
+    (0..H_SCAN_N)
+        .map(move |i| h_max * (ln_lo + (ln_hi - ln_lo) * (i as f64) / ((H_SCAN_N - 1) as f64)).exp())
+}
+
+/// What one anchor pair's `F(h)` scan looks like. **DIAGNOSTIC ONLY** -- nothing in the search
+/// consumes this, and `solve_h` is unchanged by its existence.
+///
+/// It exists to answer one question: is `F` single-rooted over the scan? `solve_h` returns the
+/// first bracket it finds, so if there are several, a lookup grid of initial guesses would land
+/// on a different root and quietly change which orbit each pair resolves to -- candidates would
+/// still solve, residuals would still look right, and every internal check would agree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScanCensus {
+    /// Sign changes of `F` between ADJACENT finite scan points: how many brackets existed.
+    pub sign_changes: usize,
+    /// Scan points where `F` was finite. `H_SCAN_N` minus this is domain gap.
+    pub finite: usize,
+    /// Maximal runs of finite points. >1 means the domain is fragmented; a sign change spanning
+    /// a gap is not counted here, and `solve_h` does not count one either.
+    pub segments: usize,
+    /// `h/h_max` at the lower edge of the FIRST bracket -- the root `solve_h` returns, and the
+    /// one any initial guess must reproduce. NaN when there is no bracket.
+    pub first_bracket_frac: f64,
+    /// `h/h_max` at the lower edge of the LAST bracket. Equals `first_bracket_frac` when
+    /// single-rooted; the spread between them is how far a guess could be wrong.
+    pub last_bracket_frac: f64,
+}
+
 impl Pair {
+    /// Walk `solve_h`'s scan and count the brackets instead of returning at the first.
+    ///
+    /// Mirrors `solve_h`'s gap handling exactly: a non-finite `F` resets the run, so a sign
+    /// change across a domain gap is not a bracket here or there.
+    pub fn scan_census(&self, node: &Node, mu: f64) -> Option<ScanCensus> {
+        let h_max = h_max(node, mu)?;
+        let mut out = ScanCensus {
+            sign_changes: 0,
+            finite: 0,
+            segments: 0,
+            first_bracket_frac: f64::NAN,
+            last_bracket_frac: f64::NAN,
+        };
+        let mut prev: Option<(f64, f64)> = None;
+        for h in h_scan_grid(h_max) {
+            let Some(v) = self.f_of_h(h, node, mu) else {
+                prev = None;
+                continue;
+            };
+            out.finite += 1;
+            if prev.is_none() {
+                out.segments += 1;
+            }
+            if let Some((h_prev, v_prev)) = prev {
+                if v_prev * v < 0.0 {
+                    out.sign_changes += 1;
+                    out.last_bracket_frac = h_prev / h_max;
+                    if out.sign_changes == 1 {
+                        out.first_bracket_frac = h_prev / h_max;
+                    }
+                }
+            }
+            prev = Some((h, v));
+        }
+        Some(out)
+    }
+
     /// The residual: geometric opening angle minus the dynamical true-anomaly sweep.
     ///
     /// `None` is a classified non-answer, not zero: either the trial `h` cannot be propagated,
@@ -441,6 +513,11 @@ impl Pair {
     /// No hint, because production has none. The scan is geometric in `h/h_max`, so the deep
     /// roots -- down to `0.04*h_max` on the fixture's own cases -- are sampled as densely in
     /// log space as the shallow ones.
+    ///
+    /// 🔴 It returns at the FIRST sign change, so "the" solution is the **smallest-h** root in
+    /// the bracket. Any future initial guess or bracket lookup converges to whichever root sits
+    /// nearest the guess, which is the same answer ONLY where `F` is single-rooted. Measure that
+    /// with [`Pair::scan_census`] before adopting one -- it is not visible in any output here.
     pub fn solve_h(&self, node: &Node, mu: f64) -> Solution {
         let Some(h_max) = h_max(node, mu) else {
             return Solution::UnboundNode;
@@ -451,11 +528,7 @@ impl Pair {
         let h_hi = h_max * H_SCAN_HI_FRAC;
 
         let mut prev: Option<(f64, f64)> = None;
-        let ln_lo = H_SCAN_LO_FRAC.ln();
-        let ln_hi = H_SCAN_HI_FRAC.ln();
-        for i in 0..H_SCAN_N {
-            let frac = (ln_lo + (ln_hi - ln_lo) * (i as f64) / ((H_SCAN_N - 1) as f64)).exp();
-            let h = h_max * frac;
+        for h in h_scan_grid(h_max) {
             let Some(v) = f(h) else {
                 // A non-finite stretch is a gap in the domain, not a sign change across it.
                 prev = None;

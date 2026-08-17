@@ -71,6 +71,13 @@ struct Cli {
     /// without paying for a run to find out.
     #[arg(long)]
     ladder_only: bool,
+
+    /// DIAGNOSTIC: over the same gated pairs a `--run` would solve, count how many brackets the
+    /// `F(h)` scan contains instead of taking the first. `solve_h` returns the smallest-h root,
+    /// so a lookup grid of initial guesses is only safe where that root is the only one. Writes
+    /// no candidates and solves nothing.
+    #[arg(long)]
+    sign_census: bool,
 }
 
 /// Which origin the frame and `mu` are taken from. Named, never numeric.
@@ -559,7 +566,11 @@ fn self_check(cfg: &Config) {
 }
 
 /// Load detections, group them, and run stage 3 for each configured node.
-fn run_search(cfg: &Config, ladder_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_search(
+    cfg: &Config,
+    ladder_only: bool,
+    sign_census: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mu = cfg.frame.origin.mu();
     let mut kernel = SpiceKernel::new();
     if let Some(sp) = &cfg.io.spice_path {
@@ -732,6 +743,12 @@ fn run_search(cfg: &Config, ladder_only: bool) -> Result<(), Box<dyn std::error:
         }
         let n_anchors: usize = per_night.iter().map(|(_, a)| a.len()).sum();
 
+        // --sign-census accumulators; all zero and unread on a normal run.
+        let mut census_hist: std::collections::BTreeMap<usize, usize> = Default::default();
+        let mut census_pairs = 0usize;
+        let mut census_fragmented = 0usize;
+        let mut census_multi: Vec<(f64, usize, f64, f64)> = Vec::new();
+
         let mut candidates = 0usize;
         let mut gated = 0usize;
         let mut accepted = 0usize;
@@ -743,6 +760,29 @@ fn run_search(cfg: &Config, ladder_only: bool) -> Result<(), Box<dyn std::error:
                 let (kb, ab) = (&per_night[j].0, &per_night[j].1);
                 let dt_days = (set.obs[ab[0].first].epoch - set.obs[aa[0].first].epoch).abs();
                 if dt_days > cfg.anchor.max_anchor_baseline_days {
+                    continue;
+                }
+                if sign_census {
+                    // 🔴 Same gate, same pairs, no solve. See anchor_pairs_and_census.
+                    for (dt_days, c) in pointdexter::spherical_pair_anchor::anchor_pairs_and_census(
+                        &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap,
+                    ) {
+                        census_pairs += 1;
+                        *census_hist.entry(c.sign_changes).or_insert(0usize) += 1;
+                        if c.segments > 1 {
+                            census_fragmented += 1;
+                        }
+                        if c.sign_changes >= 2 {
+                            // Keep the spread: how far apart the roots a guess must choose
+                            // between actually are, in the units a guess would be expressed in.
+                            census_multi.push((
+                                dt_days,
+                                c.sign_changes,
+                                c.first_bracket_frac,
+                                c.last_bracket_frac,
+                            ));
+                        }
+                    }
                     continue;
                 }
                 let (cands, t) = anchor_pairs_and_solve(
@@ -786,6 +826,51 @@ fn run_search(cfg: &Config, ladder_only: bool) -> Result<(), Box<dyn std::error:
                     ])?;
                 }
             }
+        }
+        if sign_census {
+            println!(
+                "  node r={:.2} rdot={:+.2e}: {n_anchors} anchors over {} nights -> \
+                 {census_pairs} gated pairs scanned",
+                spec.r_au,
+                spec.rdot_au_per_day,
+                per_night.len()
+            );
+            if census_pairs == 0 {
+                println!("    (no gated pairs at this node -- nothing to census)");
+                continue;
+            }
+            // 🔴 Report the ZERO-bracket bin too. Without it "single-rooted" cannot be
+            // distinguished from "no root at all", and no-bound-root is known to dominate at
+            // high |rdot| -- those pairs are not evidence either way.
+            for (k, n) in &census_hist {
+                println!(
+                    "    {k} bracket(s): {n:>10} pairs  ({:.4}%)",
+                    100.0 * (*n as f64) / (census_pairs as f64)
+                );
+            }
+            let multi: usize = census_hist.iter().filter(|(k, _)| **k >= 2).map(|(_, n)| *n).sum();
+            let rooted: usize = census_hist.iter().filter(|(k, _)| **k >= 1).map(|(_, n)| *n).sum();
+            println!(
+                "    MULTI-ROOT {multi} of {rooted} pairs that have any root ({:.4}%); \
+                 fragmented domain {census_fragmented} ({:.4}% of scanned)",
+                if rooted > 0 { 100.0 * (multi as f64) / (rooted as f64) } else { 0.0 },
+                100.0 * (census_fragmented as f64) / (census_pairs as f64)
+            );
+            if !census_multi.is_empty() {
+                let mut sp: Vec<f64> =
+                    census_multi.iter().map(|(_, _, f, l)| (l / f).abs()).collect();
+                sp.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let dt: Vec<f64> = census_multi.iter().map(|(d, _, _, _)| *d).collect();
+                println!(
+                    "    multi-root root spread h_last/h_first: median {:.3}x, max {:.3}x; \
+                     baseline dt {:.3}-{:.3} d",
+                    sp[sp.len() / 2],
+                    sp[sp.len() - 1],
+                    dt.iter().cloned().fold(f64::INFINITY, f64::min),
+                    dt.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                );
+            }
+            continue;
         }
         println!(
             "  node r={:.2} rdot={:+.2e}: {n_anchors} anchors over {} nights -> {gated} pairs \
@@ -845,13 +930,13 @@ fn main() {
     if cli.self_check {
         self_check(&cfg);
     }
-    if cli.run || cli.ladder_only {
-        if let Err(e) = run_search(&cfg, cli.ladder_only) {
+    if cli.run || cli.ladder_only || cli.sign_census {
+        if let Err(e) = run_search(&cfg, cli.ladder_only, cli.sign_census) {
             eprintln!("run failed: {e}");
             std::process::exit(1);
         }
     }
-    if !cli.print_config && !cli.self_check && !cli.run && !cli.ladder_only {
+    if !cli.print_config && !cli.self_check && !cli.run && !cli.ladder_only && !cli.sign_census {
         println!(
             "nothing to do: stage 0 validates configuration and can --self-check.\n\
              the search itself arrives with stage 3 (detections) and stage 4 (extension)."

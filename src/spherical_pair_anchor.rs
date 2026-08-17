@@ -43,8 +43,8 @@
 use nalgebra::Vector3;
 
 use crate::spherical_pair::{
-    CanonicalState, Node, Pair, PairPoint, Solution, canonical_step, hypot2, range_quadratic,
-    swept_angle,
+    CanonicalState, Node, Pair, PairPoint, ScanCensus, Solution, canonical_step, hypot2,
+    range_quadratic, swept_angle,
 };
 use crate::spherical_pair_index::{BaryIndex, gate_radius_astrometric};
 
@@ -353,6 +353,63 @@ pub fn anchor_pairs_and_solve(
         }
     }
     (out, tally)
+}
+
+/// Census variant of [`anchor_pairs_and_solve`]: same gate, same pairs, same `Pair`, but walk
+/// the whole `F(h)` scan and count brackets instead of returning at the first.
+///
+/// **DIAGNOSTIC ONLY.** It answers whether an initial-guess or bracket-lookup scheme could
+/// safely replace the blind 80-point scan -- which is true only if `F` is single-rooted.
+///
+/// 🔴 The gate and the endpoint ordering are duplicated from `anchor_pairs_and_solve` /
+/// `solve_anchor_pair` rather than shared, because those functions solve and this one must not.
+/// The duplication is the risk: a census taken over a DIFFERENT pair set measures nothing about
+/// the pairs the search actually solves. Both copies must stay in step, and the ordering guard
+/// below is not optional -- reversed endpoints return a retrograde orbit that solves silently.
+pub fn anchor_pairs_and_census(
+    obs: &[Obs],
+    anchors_a: &[Anchor],
+    anchors_b: &[Anchor],
+    node: &Node,
+    k: f64,
+    mu: f64,
+    sigma_cap: f64,
+) -> Vec<(f64, ScanCensus)> {
+    let mut out = Vec::new();
+    if anchors_a.is_empty() || anchors_b.is_empty() {
+        return out;
+    }
+    let dt_max = anchors_a
+        .iter()
+        .flat_map(|a| anchors_b.iter().map(move |b| (obs[b.first].epoch - obs[a.first].epoch).abs()))
+        .fold(0.0_f64, f64::max);
+    let cap = gate_radius_astrometric(node.r, dt_max, mu, sigma_cap, k);
+
+    let pack = |set: &[Anchor]| {
+        let o: Vec<Vector3<f64>> = set.iter().map(|a| obs[a.first].observer).collect();
+        let u: Vec<Vector3<f64>> = set.iter().map(|a| obs[a.first].rho_hat).collect();
+        let ids: Vec<u32> = (0..set.len() as u32).collect();
+        BaryIndex::build(&o, &u, &ids, node.r)
+    };
+    let ia = pack(anchors_a);
+    let ib = pack(anchors_b);
+
+    for (slot, p) in ia.points.iter().enumerate() {
+        let q = Vector3::new(p[0], p[1], p[2]);
+        for hit in ib.within_idx(&q, cap) {
+            let a = anchors_a[ia.ids[slot] as usize];
+            let b = anchors_b[ib.ids[hit] as usize];
+            // 🔴 THE ORDERING GUARD, as in solve_anchor_pair.
+            let (a, b) = if obs[a.first].epoch <= obs[b.first].epoch { (a, b) } else { (b, a) };
+            let (a0, b0) = (&obs[a.first], &obs[b.first]);
+            let t_ref = 0.5 * (a0.epoch + b0.epoch);
+            let pair = Pair { t_ref, a: a0.point(), b: b0.point() };
+            if let Some(c) = pair.scan_census(node, mu) {
+                out.push(((b0.epoch - a0.epoch).abs(), c));
+            }
+        }
+    }
+    out
 }
 
 /// Why anchor pairs did not become candidates.
