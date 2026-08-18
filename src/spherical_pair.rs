@@ -50,6 +50,35 @@ pub const ANOMALY_TOL: f64 = 1e-12;
 /// backstop, not the convergence path.
 pub const ANOMALY_MAX_ITER: usize = 100;
 
+/// Fallback tolerance for the ONE case where `ANOMALY_TOL` is unreachable.
+///
+/// 🔴 Not a loosening of the solve. `spherical_pair::canonical_step` retries at this tolerance
+/// only when the solver returns `Err`, and `polish_anomaly` then restores full precision on the
+/// series residual. Measured (`RESULT_c2_nobound_conflation.md`): on near-parabolic nodes
+/// (`a ~ 5e3-6e4 AU`) at short baselines, `solve_for_universal_anomaly` **stagnates** against
+/// `ANOMALY_TOL` -- it fails identically at 100, 10^4 and **10^6** iterations, so the cap is not
+/// the problem -- while succeeding at `1e-10` and `1e-8` and returning an `s` that agrees to 6-7
+/// figures across all three. The root is well determined; only the acceptance test fails.
+///
+/// 🔴 It must NOT be applied globally. `ANOMALY_TOL`'s own note puts 1e-12 at ~1e-13 AU of
+/// position, two orders inside the fixture's 1e-12 budget; a global 1e-8 would land far outside
+/// it. The retry is reachable only where the code previously returned `None`, so every solve that
+/// already succeeded -- and the frozen oracle -- is bit-unchanged.
+pub const ANOMALY_TOL_RETRY: f64 = 1e-8;
+
+/// How many times the `ANOMALY_TOL_RETRY` path has fired.
+///
+/// 🔴 The failure this repairs was silent for the method's whole lifetime because a solver
+/// failure was indistinguishable from a physical rejection. A repair that is ALSO silent leaves
+/// the next regression just as invisible: if the dependency's stagnating region ever widens, this
+/// counter is the only thing that says so. A run should report it.
+pub static ANOMALY_RETRY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(r, rdot, h, dt)` of the FIRST retry, so a run can hand back an exact reproducer rather than a
+/// count with no way to re-enter the case. The stagnating set is ~1e-12 wide in `h/h_max`, so a
+/// point recorded to anything less than full precision cannot be re-found.
+pub static ANOMALY_RETRY_FIRST: std::sync::OnceLock<[f64; 4]> = std::sync::OnceLock::new();
+
 /// Half-cell tolerances of the root find on `h`, relative and absolute.
 const H_XTOL: f64 = 1e-14;
 const H_RTOL: f64 = 1e-15;
@@ -63,8 +92,12 @@ pub const H_SCAN_N: usize = 80;
 
 /// The ends of the physical bracket, as fractions of `h_max`. `1 - 1e-9` rather than `1.0`
 /// because `F` is evaluated *at* the ceiling, where the orbit is marginally bound.
-const H_SCAN_LO_FRAC: f64 = 1e-6;
-const H_SCAN_HI_FRAC: f64 = 1.0 - 1e-9;
+///
+/// 🔴 `pub` so a diagnostic that re-walks the range walks the SAME range. A transcribed `1e-6`
+/// that drifted from this one would report a root the solver "missed" that is simply outside
+/// the solver's domain.
+pub const H_SCAN_LO_FRAC: f64 = 1e-6;
+pub const H_SCAN_HI_FRAC: f64 = 1.0 - 1e-9;
 
 /// A grid node: the two quantities C2 asserts at `t_ref`.
 ///
@@ -290,8 +323,27 @@ pub(crate) fn canonical_step(node: &Node, h: f64, dt: f64, mu: f64) -> Option<Ca
     }
     let v_t = h / node.r;
     let alpha = alpha_of(node, h, mu);
-    let s = solve_for_universal_anomaly(node.r, node.rdot, alpha, mu, dt, ANOMALY_TOL, ANOMALY_MAX_ITER)
-        .ok()?;
+    // 🔴 Retry on `Err`, do not discard the root. The dependency STAGNATES against `ANOMALY_TOL`
+    // near the parabolic ceiling rather than converging slowly (10^6 iterations fail identically),
+    // and the old `.ok()?` turned that into `None` -- which `solve_h` then reported as the
+    // PHYSICAL rejection `NoBoundRoot`. See `RESULT_c2_nobound_conflation.md`.
+    //
+    // Accuracy is not traded away: `polish_anomaly` below is Newton on the series residual, whose
+    // derivative is `r(s) > 0`, so the residual is strictly increasing and has EXACTLY ONE root.
+    // A looser seed therefore cannot land on a different root -- it can only start further from
+    // the same one, and two quadratic steps from ~1e-8 reach machine precision.
+    let solve = |tol: f64| {
+        solve_for_universal_anomaly(node.r, node.rdot, alpha, mu, dt, tol, ANOMALY_MAX_ITER).ok()
+    };
+    let s = match solve(ANOMALY_TOL) {
+        Some(s) => s,
+        None => {
+            let s = solve(ANOMALY_TOL_RETRY)?;
+            ANOMALY_RETRY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = ANOMALY_RETRY_FIRST.set([node.r, node.rdot, h, dt]);
+            s
+        }
+    };
     if !s.is_finite() {
         return None;
     }
@@ -403,11 +455,22 @@ pub(crate) fn swept_angle(node: &Node, h: f64, mu: f64, s0: &CanonicalState, s1:
     partial
 }
 
+/// First half-width of the guided bracket, as a multiplicative factor either side of the guess.
+///
+/// Chosen from measurement, not taste (`RESULT_c2_signcensus.md`): `h_guess/h_root` sits inside
+/// +-0.3% at `rdot = 0` and inside +-5% at p99 near the bound limit, so one step of 1.2 brackets
+/// the overwhelming majority on the first try.
+const H_GUESS_KAPPA: f64 = 1.2;
+
+/// How many geometric expansions before the guess is declared uninformative and the full scan
+/// takes over. `1.2^12 ~ 8.9`, which covers the measured 5.4x tail with room to spare.
+const H_GUESS_MAX_EXPAND: usize = 12;
+
 /// The scan grid `solve_h` walks, geometric in `h/h_max`.
 ///
 /// 🔴 Extracted so that a diagnostic which re-walks the scan CANNOT silently drift from the scan
 /// the solver actually uses. A census taken on a grid that is not this one measures nothing.
-fn h_scan_grid(h_max: f64) -> impl Iterator<Item = f64> {
+pub fn h_scan_grid(h_max: f64) -> impl Iterator<Item = f64> {
     let ln_lo = H_SCAN_LO_FRAC.ln();
     let ln_hi = H_SCAN_HI_FRAC.ln();
     (0..H_SCAN_N)
@@ -433,12 +496,68 @@ pub struct ScanCensus {
     /// `h/h_max` at the lower edge of the FIRST bracket -- the root `solve_h` returns, and the
     /// one any initial guess must reproduce. NaN when there is no bracket.
     pub first_bracket_frac: f64,
+    /// `h/h_max` at the UPPER edge of the first bracket. One geometric grid step above the
+    /// lower edge, ~1.19x. Recorded rather than derived so a consumer cannot assume the step.
+    pub first_bracket_hi_frac: f64,
+    /// `h/h_max` of the CONVERGED root, from the same Brent `solve_h` uses. NaN if no bracket.
+    ///
+    /// 🔴 Scoring a guess against the bracket's centre instead of this measures the GRID, not
+    /// the guess: the bracket is ~1.19x wide, so a perfect guess still scatters over
+    /// +-1.0914x -- and that is exactly the spread the first run of this census produced.
+    /// A guess error below one half grid step is invisible without converging first.
+    pub root_frac: f64,
+    /// `h/h_max` of the closed-form guess from [`Pair::h_guess`]. NaN when the geometry cannot
+    /// supply one. Carried here so the guess can be scored against the bracket that contains the
+    /// true root, on the same pairs, without a second pass.
+    pub h_guess_frac: f64,
     /// `h/h_max` at the lower edge of the LAST bracket. Equals `first_bracket_frac` when
     /// single-rooted; the spread between them is how far a guess could be wrong.
     pub last_bracket_frac: f64,
 }
 
+/// `solve_h` against `solve_h_guided` on one pair. **DIAGNOSTIC ONLY.**
+///
+/// 🔴 Both solvers are run and compared here rather than asserted equal, because the guided one
+/// is NOT bit-identical by construction: Brent from a different bracket converges to the same
+/// root, not to the same last bits. The acceptance criterion is a relative tolerance plus zero
+/// tolerance on a changed OUTCOME.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GuidedCheck {
+    /// Both returned `Bound`, or neither did.
+    pub outcome_agrees: bool,
+    /// `|h_guided - h_scan| / h_scan` when both are `Bound`; NaN otherwise.
+    pub rel_diff: f64,
+    /// Whether the scan-based solver found a root at all -- the population split that decides
+    /// whether the guided path is a win at this node.
+    pub scan_bound: bool,
+    pub ns_scan: u64,
+    pub ns_guided: u64,
+}
+
 impl Pair {
+    /// Run both solvers on this pair and compare. See [`GuidedCheck`].
+    pub fn guided_check(&self, node: &Node, mu: f64) -> GuidedCheck {
+        let t0 = std::time::Instant::now();
+        let a = self.solve_h(node, mu);
+        let ns_scan = t0.elapsed().as_nanos() as u64;
+        let t1 = std::time::Instant::now();
+        let b = self.solve_h_guided(node, mu);
+        let ns_guided = t1.elapsed().as_nanos() as u64;
+
+        let ha = if let Solution::Bound { h, .. } = a { Some(h) } else { None };
+        let hb = if let Solution::Bound { h, .. } = b { Some(h) } else { None };
+        GuidedCheck {
+            outcome_agrees: ha.is_some() == hb.is_some(),
+            rel_diff: match (ha, hb) {
+                (Some(x), Some(y)) if x != 0.0 => ((y - x) / x).abs(),
+                _ => f64::NAN,
+            },
+            scan_bound: ha.is_some(),
+            ns_scan,
+            ns_guided,
+        }
+    }
+
     /// Walk `solve_h`'s scan and count the brackets instead of returning at the first.
     ///
     /// Mirrors `solve_h`'s gap handling exactly: a non-finite `F` resets the run, so a sign
@@ -450,11 +569,15 @@ impl Pair {
             finite: 0,
             segments: 0,
             first_bracket_frac: f64::NAN,
+            first_bracket_hi_frac: f64::NAN,
+            root_frac: f64::NAN,
             last_bracket_frac: f64::NAN,
+            h_guess_frac: self.h_guess(node).map(|h| h / h_max).unwrap_or(f64::NAN),
         };
+        let f = |h: f64| self.f_of_h(h, node, mu);
         let mut prev: Option<(f64, f64)> = None;
         for h in h_scan_grid(h_max) {
-            let Some(v) = self.f_of_h(h, node, mu) else {
+            let Some(v) = f(h) else {
                 prev = None;
                 continue;
             };
@@ -468,12 +591,94 @@ impl Pair {
                     out.last_bracket_frac = h_prev / h_max;
                     if out.sign_changes == 1 {
                         out.first_bracket_frac = h_prev / h_max;
+                        out.first_bracket_hi_frac = h / h_max;
+                        // The same Brent `solve_h` runs, on the same bracket, so `root_frac` is
+                        // the root the solver would have returned -- not an approximation to it.
+                        out.root_frac =
+                            brent(&f, h_prev, v_prev, h, v).map(|r| r / h_max).unwrap_or(f64::NAN);
                     }
                 }
             }
             prev = Some((h, v));
         }
         Some(out)
+    }
+
+    /// `solve_h`, started from [`Pair::h_guess`] instead of from a blind 80-point scan.
+    ///
+    /// Bracket the guess, widen geometrically until `F` changes sign across the bracket, then
+    /// hand that bracket to the same Brent. Typical cost is ~2 evaluations to bracket plus the
+    /// Brent, against 160 evaluations for the scan.
+    ///
+    /// 🔴 **It expands until it OBSERVES a sign change; it never assumes one.** That is what
+    /// makes it safe to start from an approximation: a guess that is wrong merely costs extra
+    /// evaluations, and a guess that is useless costs a fallback to the full scan. It cannot
+    /// silently converge to the wrong thing.
+    ///
+    /// 🔴 It is only equivalent to `solve_h` because `F` was measured single-rooted over
+    /// 4.7M gated pairs (`RESULT_c2_signcensus.md`). With two roots, "the root nearest the
+    /// guess" and "the smallest-h root" are different answers and this would quietly return the
+    /// other one. Re-run that census before trusting this at baselines beyond ~41 d.
+    ///
+    /// ⚠️ For a pair with NO root this is *slower* than `solve_h`: it pays the expansion and
+    /// then the full scan anyway. That population is ~1% at `rdot = 0` but over 90% near the
+    /// bound limit, so the net gain is node-dependent -- measured, not assumed, in the census.
+    pub fn solve_h_guided(&self, node: &Node, mu: f64) -> Solution {
+        let Some(h_max) = h_max(node, mu) else {
+            return Solution::UnboundNode;
+        };
+        let Some(h0) = self.h_guess(node) else {
+            return self.solve_h(node, mu);
+        };
+        let f = |h: f64| self.f_of_h(h, node, mu);
+        let h_lo = h_max * H_SCAN_LO_FRAC;
+        let h_hi = h_max * H_SCAN_HI_FRAC;
+        // The guess is geometry, not a bounded quantity: it can land outside the physical range.
+        let h0 = h0.clamp(h_lo, h_hi);
+
+        let mut kappa = H_GUESS_KAPPA;
+        for _ in 0..H_GUESS_MAX_EXPAND {
+            let lo = (h0 / kappa).max(h_lo);
+            let hi = (h0 * kappa).min(h_hi);
+            if let (Some(a), Some(b)) = (f(lo), f(hi)) {
+                // A single root inside [lo, hi] is exactly what a sign change at the ENDS
+                // detects; widening is what moves the ends past it when it is outside.
+                if a * b < 0.0 {
+                    if let Some(root) = brent(&f, lo, a, hi, b) {
+                        return Solution::Bound { h: root, h_max };
+                    }
+                }
+            }
+            if lo <= h_lo && hi >= h_hi {
+                break; // the whole physical range, and still no sign change at the ends
+            }
+            kappa *= H_GUESS_KAPPA;
+        }
+        // 🔴 The scan is the authority, not this. Never report NoBoundRoot on the strength of
+        // the expansion alone -- that would convert a measured property into an assumption.
+        self.solve_h(node, mu)
+    }
+
+    /// A closed-form initial guess for the root of `F`, from the pair's geometry alone.
+    ///
+    /// `r^2 dnu/dt = h`, so matching the observed barycentric opening angle across the baseline
+    /// gives `h ~ theta * r^2 / dt`. Two `range_quadratic` calls and an `atan2`: **no
+    /// propagation, no Kepler solve, and nothing the search does not already have.**
+    ///
+    /// 🔴 Approximate by construction. It evaluates both endpoints at the node's asserted `r`,
+    /// where the solve lets `r_a` and `r_b` float with `h`, and it takes the sweep as linear in
+    /// time. It is a starting point for a bracket, **never an answer** -- and it is only safe as
+    /// a starting point because `F` was measured single-rooted (RESULT_c2_signcensus.md).
+    pub fn h_guess(&self, node: &Node) -> Option<f64> {
+        let dt = self.b.epoch - self.a.epoch;
+        if !(dt > 0.0) {
+            return None;
+        }
+        let p0 = range_quadratic(&self.a.observer, &self.a.rho_hat, node.r)?;
+        let p1 = range_quadratic(&self.b.observer, &self.b.rho_hat, node.r)?;
+        let theta = p0.cross(&p1).norm().atan2(p0.dot(&p1));
+        let h = theta * node.r * node.r / dt;
+        if h.is_finite() && h > 0.0 { Some(h) } else { None }
     }
 
     /// The residual: geometric opening angle minus the dynamical true-anomaly sweep.
@@ -601,7 +806,11 @@ pub fn gate_radius(r_lower_edge: f64, dt: f64, mu: f64) -> f64 {
 /// Written out rather than pulled in: the only dependency that would supply it is a numerics
 /// crate this repo does not carry, and the routine is short enough that a transcription is
 /// cheaper than a new dependency in someone else's Cargo.toml.
-fn brent<F>(f: &F, mut a: f64, mut fa: f64, mut b: f64, mut fb: f64) -> Option<f64>
+///
+/// 🔴 `pub` so a diagnostic can trace THIS routine by wrapping `f`, rather than re-implementing
+/// it. A replica that drifted by one acceptance condition would take a different path through
+/// the bracket and would not reproduce the failure it is being used to explain.
+pub fn brent<F>(f: &F, mut a: f64, mut fa: f64, mut b: f64, mut fb: f64) -> Option<f64>
 where
     F: Fn(f64) -> Option<f64>,
 {
@@ -889,6 +1098,68 @@ mod tests {
         // is the sweep and not something about this synthetic pair.
         let short = Pair { b: PairPoint { epoch: t_ref + 365.25, ..pair.b.clone() }, ..pair.clone() };
         assert!(short.f_of_h(h, &n, mu()).is_some());
+    }
+
+    /// 🔴 REGRESSION, `RESULT_c2_nobound_conflation.md`. Captured by `ANOMALY_RETRY_FIRST` from a
+    /// real census run; full precision is not decoration, the stagnating set is ~1e-12 wide in
+    /// `h/h_max` and a point rounded to fewer digits does not re-enter it.
+    ///
+    /// Before the retry, `canonical_step` returned `None` here, `f_of_h` was non-finite at this
+    /// exact `h`, `brent` aborted on it, and `solve_h` reported the PHYSICAL rejection
+    /// `NoBoundRoot`. The pair was a real bound orbit with a real sign change on the scan grid.
+    #[test]
+    fn canonical_step_survives_the_dependency_stagnating_near_parabolic() {
+        let node = Node { r: 3.40000000000000000e1, rdot: 4.00000000000000008e-3 };
+        let h = 4.05837124060365595e-2;
+        let dt = 1.03887515938840806e1;
+        let mu = mu();
+
+        // 1. The tight tolerance still fails. If a dependency upgrade ever fixes this, THIS
+        //    assertion fires and tells us the retry has become dead code -- rather than the retry
+        //    quietly covering for something that no longer happens.
+        let alpha = alpha_of(&node, h, mu);
+        assert!(
+            solve_for_universal_anomaly(node.r, node.rdot, alpha, mu, dt, ANOMALY_TOL, ANOMALY_MAX_ITER)
+                .is_err(),
+            "the dependency now converges at ANOMALY_TOL here; the retry may be removable"
+        );
+
+        // 2. The step nonetheless produces a state.
+        let st = canonical_step(&node, h, dt, mu).expect("retry path must produce a state");
+
+        assert!(hypot2(st.pos).is_finite());
+
+        // 3. 🔴 And it is ACCURATE -- the whole question, since a retry that merely returned A
+        //    NUMBER would be worse than the `None` it replaces.
+        //
+        //    ⚠️ NOT tested by energy conservation, which is what this test first tried. The f-and-g
+        //    functions place the state on the SAME CONIC for any `s` whatever, so specific energy
+        //    is conserved identically (measured: relative error exactly 0.0) even when `s` does
+        //    not solve Kepler's equation at all. It tests the orbit and never the TIME, i.e. it is
+        //    a control the construction already guarantees.
+        //
+        //    The quantity that does move is the Kepler residual itself: `s` is defined by
+        //    `f(s) = 0`, and the looser seed is accepted at ~`ANOMALY_TOL_RETRY`. This asserts
+        //    that `polish_anomaly` closes that gap rather than the retry banking a sloppy root.
+        let sqrt_mu = mu.sqrt();
+        let residual = |s: f64| {
+            let z = alpha * s * s;
+            let (c, sc) = stumpff_c2_c3(z);
+            (node.r * node.rdot / sqrt_mu) * s * s * c
+                + (1.0 - alpha * node.r) * s * s * s * sc
+                + node.r * s
+                - sqrt_mu * dt
+        };
+        let s_seed =
+            solve_for_universal_anomaly(node.r, node.rdot, alpha, mu, dt, ANOMALY_TOL_RETRY, ANOMALY_MAX_ITER)
+                .expect("the relaxed tolerance is what makes the retry possible");
+        let s_polished = polish_anomaly(s_seed, &node, alpha, mu, dt);
+        let (before, after) = (residual(s_seed).abs(), residual(s_polished).abs());
+        assert!(
+            after < 1e-15,
+            "polish left the Kepler residual at {after:.3e} (seed was {before:.3e})"
+        );
+        assert!(after < before, "polish did not improve the seed: {before:.3e} -> {after:.3e}");
     }
 
     #[test]

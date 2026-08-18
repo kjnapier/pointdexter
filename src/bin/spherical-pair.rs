@@ -32,9 +32,13 @@ use serde::{Deserialize, Serialize};
 use spacerocks::coordinates::Origin;
 
 use spacerocks::SpiceKernel;
+use spacerocks::transforms::solve_for_universal_anomaly;
 
 use pointdexter::io::load_detections::load_detections;
-use pointdexter::spherical_pair::{Node, gate_radius, range_quadratic};
+use pointdexter::spherical_pair::{
+    H_SCAN_HI_FRAC, H_SCAN_LO_FRAC, Node, Pair, Solution, gate_radius, h_max, h_scan_grid,
+    range_quadratic,
+};
 use pointdexter::spherical_pair_anchor::{Anchor, anchor_pairs_and_solve, build_anchors};
 use pointdexter::spherical_pair_extend::{ExtendParams, VisitIndex, extend_candidate};
 use pointdexter::spherical_pair_index::{
@@ -748,6 +752,14 @@ fn run_search(
         let mut census_pairs = 0usize;
         let mut census_fragmented = 0usize;
         let mut census_multi: Vec<(f64, usize, f64, f64)> = Vec::new();
+        let mut census_ratio: Vec<f64> = Vec::new();
+        let mut census_no_guess = 0usize;
+        let mut guided_rel: Vec<f64> = Vec::new();
+        let mut guided_outcome_diff = 0usize;
+        let mut guided_disagree_pairs: Vec<pointdexter::spherical_pair::Pair> = Vec::new();
+        let (mut guided_ns_scan, mut guided_ns_guided) = (0u64, 0u64);
+        let (mut guided_ns_scan_rooted, mut guided_ns_guided_rooted) = (0u64, 0u64);
+        let mut guided_rooted = 0usize;
 
         let mut candidates = 0usize;
         let mut gated = 0usize;
@@ -764,13 +776,40 @@ fn run_search(
                 }
                 if sign_census {
                     // 🔴 Same gate, same pairs, no solve. See anchor_pairs_and_census.
-                    for (dt_days, c) in pointdexter::spherical_pair_anchor::anchor_pairs_and_census(
-                        &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap,
-                    ) {
+                    let (census_rows, disagreeing) =
+                        pointdexter::spherical_pair_anchor::anchor_pairs_and_census(
+                            &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap,
+                        );
+                    guided_disagree_pairs.extend(disagreeing);
+                    for (dt_days, c, g) in census_rows {
                         census_pairs += 1;
                         *census_hist.entry(c.sign_changes).or_insert(0usize) += 1;
+                        guided_ns_scan += g.ns_scan;
+                        guided_ns_guided += g.ns_guided;
+                        if !g.outcome_agrees {
+                            guided_outcome_diff += 1;
+                        }
+                        if g.rel_diff.is_finite() {
+                            guided_rel.push(g.rel_diff);
+                        }
+                        if g.scan_bound {
+                            guided_ns_scan_rooted += g.ns_scan;
+                            guided_ns_guided_rooted += g.ns_guided;
+                            guided_rooted += 1;
+                        }
                         if c.segments > 1 {
                             census_fragmented += 1;
+                        }
+                        if c.sign_changes == 1 {
+                            // 🔴 Against the CONVERGED root, never the bracket centre -- the
+                            // bracket is ~1.19x wide, so the centre measures the grid and
+                            // reports +-9% for a perfect guess. Ratio, not difference: h spans
+                            // decades across the scan.
+                            if c.h_guess_frac.is_finite() && c.root_frac > 0.0 {
+                                census_ratio.push(c.h_guess_frac / c.root_frac);
+                            } else {
+                                census_no_guess += 1;
+                            }
                         }
                         if c.sign_changes >= 2 {
                             // Keep the spread: how far apart the roots a guess must choose
@@ -856,6 +895,72 @@ fn run_search(
                 if rooted > 0 { 100.0 * (multi as f64) / (rooted as f64) } else { 0.0 },
                 100.0 * (census_fragmented as f64) / (census_pairs as f64)
             );
+            if !census_ratio.is_empty() {
+                census_ratio.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let q = |f: f64| census_ratio[((census_ratio.len() - 1) as f64 * f) as usize];
+                println!(
+                    "    GUESS h_guess/h_root over {} single-rooted pairs ({} had no guess):",
+                    census_ratio.len(),
+                    census_no_guess
+                );
+                println!(
+                    "      p01 {:.4}  p05 {:.4}  p50 {:.4}  p95 {:.4}  p99 {:.4}  \
+                     min {:.4}  max {:.4}",
+                    q(0.01), q(0.05), q(0.50), q(0.95), q(0.99),
+                    census_ratio[0],
+                    census_ratio[census_ratio.len() - 1]
+                );
+                // 🔴 The operational number: a bracket [h_guess/k, h_guess*k] must CONTAIN the
+                // root, or the solver has to fall back to the full scan. Report the miss rate,
+                // because a guess that is usually excellent and occasionally absent is a
+                // different engineering problem from one that is uniformly mediocre.
+                print!("      inside a factor k of the root:");
+                for k in [1.2_f64, 1.5, 2.0, 3.0, 5.0, 10.0] {
+                    let n = census_ratio.iter().filter(|r| **r >= 1.0 / k && **r <= k).count();
+                    print!("  k={k}: {:.4}%", 100.0 * (n as f64) / (census_ratio.len() as f64));
+                }
+                println!();
+            }
+            if !guided_rel.is_empty() || guided_outcome_diff > 0 {
+                guided_rel.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let worst = guided_rel.last().copied().unwrap_or(f64::NAN);
+                let over_tol = guided_rel.iter().filter(|d| **d > 1e-10).count();
+                println!(
+                    "    GUIDED vs SCAN: outcome disagreements {guided_outcome_diff}; \
+                     |dh|/h over {} both-bound pairs: median {:.3e} max {:.3e}; \
+                     over 1e-10: {over_tol}",
+                    guided_rel.len(),
+                    guided_rel[guided_rel.len() / 2],
+                    worst
+                );
+                // 🔴 Split rooted from unrooted. The guided path pays expansion AND the fallback
+                // scan when there is no root, so a single blended speedup hides a real loss on
+                // the population that dominates near the bound limit.
+                let sp = |a: u64, b: u64| if b > 0 { (a as f64) / (b as f64) } else { f64::NAN };
+                println!(
+                    "      speedup all pairs {:.2}x ({:.1} vs {:.1} ms); \
+                     rooted-only {:.2}x over {guided_rooted} pairs",
+                    sp(guided_ns_scan, guided_ns_guided),
+                    guided_ns_scan as f64 / 1e6,
+                    guided_ns_guided as f64 / 1e6,
+                    sp(guided_ns_scan_rooted, guided_ns_guided_rooted),
+                );
+                report_guided_disagreements(&guided_disagree_pairs, &node, mu);
+            }
+            // 🔴 Report the retry path even when it never fires -- "0" is the statement that the
+            // dependency's stagnating region was not entered, which is exactly what a run after
+            // the fix needs to be able to say out loud.
+            {
+                use pointdexter::spherical_pair::{ANOMALY_RETRY_COUNT, ANOMALY_RETRY_FIRST};
+                let n = ANOMALY_RETRY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                print!("    ANOMALY_TOL_RETRY fired {n} time(s) cumulatively");
+                match ANOMALY_RETRY_FIRST.get() {
+                    Some([r, rdot, h, dt]) => println!(
+                        "; first at r={r:.17e} rdot={rdot:.17e} h={h:.17e} dt={dt:.17e}"
+                    ),
+                    None => println!(),
+                }
+            }
             if !census_multi.is_empty() {
                 let mut sp: Vec<f64> =
                     census_multi.iter().map(|(_, _, f, l)| (l / f).abs()).collect();
@@ -941,5 +1046,285 @@ fn main() {
             "nothing to do: stage 0 validates configuration and can --self-check.\n\
              the search itself arrives with stage 3 (detections) and stage 4 (extension)."
         );
+    }
+}
+
+/// 🔴 DIAGNOSTIC. Why did `solve_h_guided` reach a different OUTCOME from `solve_h`?
+///
+/// `solve_h_guided` falls back to `solve_h` whenever its expansion fails to observe a sign
+/// change, so its `Bound` set is a SUPERSET of the scan's and every disagreement is the guided
+/// path finding a root the 80-point scan did not. Three mechanisms could do that, and they have
+/// very different consequences:
+///
+///   (a) TWO roots inside ONE coarse cell. An even crossing count is invisible to a scan that
+///       only compares adjacent grid points -- and it would mean `RESULT_c2_signcensus.md`'s
+///       single-rootedness is a property of the GRID's resolution, not of `F`.
+///   (b) A root against a domain gap, where a non-finite `F` sets `prev = None` and the scan
+///       cannot see across the reset.
+///   (c) `F` grazing zero at the level of its own rounding, in which case the extra "root" is
+///       numerical noise and the guided path is manufacturing candidates.
+///
+/// (c) is separated from (a)/(b) by scale: a real crossing has |F| at the bracket ends
+/// comparable to `F`'s range over the scan, a grazing one is orders below it.
+fn report_guided_disagreements(pairs: &[Pair], node: &Node, mu: f64) {
+    if pairs.is_empty() {
+        return;
+    }
+    // Dense enough that a coarse cell (ratio 1.1911) holds ~250 fine points, so a root PAIR
+    // inside one cell is resolved rather than stepped over a second time.
+    const N_FINE: usize = 20001;
+
+    println!("    🔴 GUIDED-vs-SCAN DISAGREEMENTS: {} pair(s) at this node", pairs.len());
+    for (idx, pair) in pairs.iter().enumerate() {
+        let Some(hm) = h_max(node, mu) else { continue };
+        let f = |h: f64| pair.f_of_h(h, node, mu);
+        let dt = pair.b.epoch - pair.a.epoch;
+
+        // The coarse grid the solver actually walks -- from the solver's own iterator, never a
+        // transcription of it.
+        let coarse: Vec<(f64, Option<f64>)> = h_scan_grid(hm).map(|h| (h, f(h))).collect();
+        let coarse_finite = coarse.iter().filter(|(_, v)| v.is_some()).count();
+        let mut coarse_segments = 0usize;
+        let mut prev_finite = false;
+        for (_, v) in &coarse {
+            if v.is_some() && !prev_finite {
+                coarse_segments += 1;
+            }
+            prev_finite = v.is_some();
+        }
+
+        // A much finer walk of the SAME range.
+        let (ln_lo, ln_hi) = (H_SCAN_LO_FRAC.ln(), H_SCAN_HI_FRAC.ln());
+        let fine: Vec<(f64, Option<f64>)> = (0..N_FINE)
+            .map(|i| {
+                let h = hm * (ln_lo + (ln_hi - ln_lo) * (i as f64) / ((N_FINE - 1) as f64)).exp();
+                (h, f(h))
+            })
+            .collect();
+        let f_scale = fine
+            .iter()
+            .filter_map(|(_, v)| *v)
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        let fine_finite = fine.iter().filter(|(_, v)| v.is_some()).count();
+
+        // Sign changes on the fine grid, mirroring the solver's gap handling (a non-finite
+        // point resets the run, so a crossing spanning a gap is not counted).
+        let mut roots: Vec<(f64, f64, f64, f64)> = Vec::new(); // (h_lo, h_hi, f_lo, f_hi)
+        let mut prev: Option<(f64, f64)> = None;
+        for (h, v) in &fine {
+            let Some(v) = *v else {
+                prev = None;
+                continue;
+            };
+            if let Some((hp, vp)) = prev {
+                if vp * v < 0.0 {
+                    roots.push((hp, *h, vp, v));
+                }
+            }
+            prev = Some((*h, v));
+        }
+
+        let guided = match pair.solve_h_guided(node, mu) {
+            Solution::Bound { h, .. } => h / hm,
+            _ => f64::NAN,
+        };
+        println!(
+            "      [{idx}] dt={dt:.4} d  h_max={hm:.6e}  |F|max={f_scale:.3e}  \
+             coarse finite {coarse_finite}/{} segs {coarse_segments}  fine finite {fine_finite}/{N_FINE}  \
+             fine crossings {}  guided h/h_max={guided:.6e}",
+            coarse.len(),
+            roots.len()
+        );
+
+        for (hlo, hhi, flo, fhi) in &roots {
+            // Bisect in place: `brent` is private to the library and this only needs to locate
+            // the root well enough to say WHICH coarse cell it falls in.
+            let (mut a, mut b, mut fa) = (*hlo, *hhi, *flo);
+            for _ in 0..80 {
+                let m = 0.5 * (a + b);
+                match f(m) {
+                    Some(fm) if fa * fm < 0.0 => b = m,
+                    Some(fm) => {
+                        a = m;
+                        fa = fm;
+                    }
+                    None => break,
+                }
+            }
+            let root = 0.5 * (a + b);
+            // Which coarse cell contains it, and what the scan saw at that cell's ends.
+            let j = coarse.iter().position(|(h, _)| *h > root);
+            let cell = match j {
+                Some(0) | None => "outside the coarse cells".to_string(),
+                Some(j) => {
+                    let (h0, v0) = coarse[j - 1];
+                    let (h1, v1) = coarse[j];
+                    let n_here = roots
+                        .iter()
+                        .filter(|(rl, rh, _, _)| {
+                            let m = 0.5 * (rl + rh);
+                            m > h0 && m <= h1
+                        })
+                        .count();
+                    format!(
+                        "coarse cell {}..{} [{:.4e},{:.4e}] F=({}, {}) -- {n_here} fine crossing(s) in it",
+                        j - 1,
+                        j,
+                        h0 / hm,
+                        h1 / hm,
+                        v0.map(|x| format!("{x:+.3e}")).unwrap_or("NONE".into()),
+                        v1.map(|x| format!("{x:+.3e}")).unwrap_or("NONE".into()),
+                    )
+                }
+            };
+            println!(
+                "          root h/h_max={:.6e}  ends F=({:+.3e},{:+.3e})  |F|end/|F|max={:.2e}  {cell}",
+                root / hm,
+                flo,
+                fhi,
+                flo.abs().max(fhi.abs()) / f_scale.max(f64::MIN_POSITIVE),
+            );
+
+            // 🔴 THE POINT OF THIS DIAGNOSTIC. `solve_h` saw this sign change too -- it walks the
+            // same grid -- so the only way it reported NoBoundRoot is that `brent` handed back
+            // `None`, and `brent` has exactly two of those: a non-bracketing input (excluded, the
+            // ends differ in sign) and `let fs = f(s)?` on an interior trial point.
+            //
+            // Run the REAL `brent` on the real coarse cell, with `f` wrapped in a recorder, so the
+            // trial sequence and the first non-finite point are the solver's own, not a replica's.
+            if let Some(j) = j {
+                if j > 0 {
+                    let (h0, v0) = coarse[j - 1];
+                    let (h1, v1) = coarse[j];
+                    if let (Some(fa), Some(fb)) = (v0, v1) {
+                        let trace = std::cell::RefCell::new(Vec::<(f64, bool)>::new());
+                        let traced = |h: f64| {
+                            let v = pair.f_of_h(h, node, mu);
+                            trace.borrow_mut().push((h, v.is_some()));
+                            v
+                        };
+                        let out = pointdexter::spherical_pair::brent(&traced, h0, fa, h1, fb);
+                        let t = trace.borrow();
+                        let n_none = t.iter().filter(|(_, ok)| !ok).count();
+                        let first_none = t.iter().find(|(_, ok)| !ok).map(|(h, _)| *h / hm);
+                        println!(
+                            "          BRENT on that cell -> {}  ({} evals, {n_none} non-finite{})",
+                            match out {
+                                Some(r) => format!("Some({:.6e})", r / hm),
+                                None => "🔴 None  => solve_h reports NoBoundRoot".to_string(),
+                            },
+                            t.len(),
+                            match first_none {
+                                Some(h) => format!(", first at h/h_max={h:.9e}"),
+                                None => String::new(),
+                            },
+                        );
+                        if let Some(hbad) = first_none {
+                            // How wide is the non-finite region, and does the scan's own grid
+                            // straddle it? A sliver narrower than a fine-grid step is invisible
+                            // to every diagnostic that has been run on this so far.
+                            // Bisect toward the cell ends, which the scan already evaluated as
+                            // finite, so each edge costs 60 evals rather than an unbounded walk.
+                            let probe = |x: f64| pair.f_of_h(x * hm, node, mu).is_some();
+                            let (mut lo_ok, mut lo) = (h0 / hm, hbad);
+                            for _ in 0..60 {
+                                let m = 0.5 * (lo_ok + lo);
+                                if probe(m) { lo_ok = m } else { lo = m }
+                            }
+                            let (mut hi_ok, mut hi) = (h1 / hm, hbad);
+                            for _ in 0..60 {
+                                let m = 0.5 * (hi_ok + hi);
+                                if probe(m) { hi_ok = m } else { hi = m }
+                            }
+                            println!(
+                                "          non-finite region spans h/h_max [{lo:.12e}, {hi:.12e}] \
+                                 (width {:.3e}); H_SCAN_HI_FRAC={:.12e}",
+                                hi - lo,
+                                H_SCAN_HI_FRAC,
+                            );
+
+                            // WHICH component goes non-finite. `f_of_h` has four ways to return
+                            // None; naming the one that fires is the difference between "the
+                            // Kepler step failed" and "the geometry was unreachable".
+                            let hmid = 0.5 * (lo + hi) * hm;
+                            let dta = pair.a.epoch - pair.t_ref;
+                            let dtb = pair.b.epoch - pair.t_ref;
+                            let ra = pointdexter::spherical_pair::radial_at(node, hmid, dta, mu);
+                            let rb = pointdexter::spherical_pair::radial_at(node, hmid, dtb, mu);
+                            let v_sq = node.rdot * node.rdot + (hmid / node.r) * (hmid / node.r);
+                            let alpha = 2.0 / node.r - v_sq / mu; // 1/a; -> 0 at the parabolic ceiling
+                            let geom = match (ra, rb) {
+                                (Some((r0, _)), Some((r1, _))) => {
+                                    let p0 = range_quadratic(&pair.a.observer, &pair.a.rho_hat, r0);
+                                    let p1 = range_quadratic(&pair.b.observer, &pair.b.rho_hat, r1);
+                                    format!(
+                                        "range_quadratic a={} b={}",
+                                        if p0.is_some() { "ok" } else { "🔴 None" },
+                                        if p1.is_some() { "ok" } else { "🔴 None" },
+                                    )
+                                }
+                                _ => "not reached".to_string(),
+                            };
+                            println!(
+                                "          at the sliver: canonical_step a={} b={}; {geom}; \
+                                 alpha=1/a={alpha:.6e} AU^-1, a={:.4e} AU",
+                                if ra.is_some() { "ok" } else { "🔴 None" },
+                                if rb.is_some() { "ok" } else { "🔴 None" },
+                                1.0 / alpha,
+                            );
+
+                            // 🔴 OURS or the DEPENDENCY'S? `canonical_step` can return None from
+                            // `solve_for_universal_anomaly(..).ok()?` (spacerocks) or from its own
+                            // finite checks after `polish_anomaly` (this repo). Call the
+                            // dependency directly on the failing epoch to split the two.
+                            let dt_bad = if ra.is_none() { dta } else { dtb };
+                            match solve_for_universal_anomaly(
+                                node.r,
+                                node.rdot,
+                                alpha,
+                                mu,
+                                dt_bad,
+                                pointdexter::spherical_pair::ANOMALY_TOL,
+                                pointdexter::spherical_pair::ANOMALY_MAX_ITER,
+                            ) {
+                                Err(e) => println!(
+                                    "          => spacerocks solve_for_universal_anomaly ERRORS \
+                                     on dt={dt_bad:.6} d: {e:?}  (the dependency, not polish)"
+                                ),
+                                Ok(s) => println!(
+                                    "          => spacerocks returned s={s:.9e} (finite={}); the \
+                                     None comes from OUR polish/finite checks, not the dependency",
+                                    s.is_finite()
+                                ),
+                            }
+                            // Slow convergence or genuine stagnation? More iterations fixes the
+                            // first; only a different residual fixes the second. This decides
+                            // whether the repair is a constant or a solver.
+                            let variants = [
+                                ("tol 1e-12, iter 1e4", 1e-12, 10_000usize),
+                                ("tol 1e-12, iter 1e6", 1e-12, 1_000_000usize),
+                                ("tol 1e-10, iter 100", 1e-10, 100usize),
+                                ("tol 1e-8,  iter 100", 1e-8, 100usize),
+                                ("tol 1e-6,  iter 100", 1e-6, 100usize),
+                            ];
+                            let mut report = Vec::new();
+                            for (label, tol, iter) in variants {
+                                let r = solve_for_universal_anomaly(
+                                    node.r, node.rdot, alpha, mu, dt_bad, tol, iter,
+                                );
+                                report.push(format!(
+                                    "{label}: {}",
+                                    match r {
+                                        Ok(s) => format!("ok s={s:.6e}"),
+                                        Err(_) => "ERR".to_string(),
+                                    }
+                                ));
+                            }
+                            println!("          => {}", report.join(" | "));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

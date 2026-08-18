@@ -43,8 +43,8 @@
 use nalgebra::Vector3;
 
 use crate::spherical_pair::{
-    CanonicalState, Node, Pair, PairPoint, ScanCensus, Solution, canonical_step, hypot2,
-    range_quadratic, swept_angle,
+    CanonicalState, GuidedCheck, Node, Pair, PairPoint, ScanCensus, Solution, canonical_step,
+    hypot2, range_quadratic, swept_angle,
 };
 use crate::spherical_pair_index::{BaryIndex, gate_radius_astrometric};
 
@@ -374,10 +374,14 @@ pub fn anchor_pairs_and_census(
     k: f64,
     mu: f64,
     sigma_cap: f64,
-) -> Vec<(f64, ScanCensus)> {
+) -> (Vec<(f64, ScanCensus, GuidedCheck)>, Vec<Pair>) {
     let mut out = Vec::new();
+    // 🔴 The pairs where `solve_h` and `solve_h_guided` reached DIFFERENT outcomes, carried out
+    // of the SAME loop rather than re-derived by a second pass over a re-built pair set. A
+    // duplicated gate would hand back pairs that are not the ones that disagreed.
+    let mut disagree = Vec::new();
     if anchors_a.is_empty() || anchors_b.is_empty() {
-        return out;
+        return (out, disagree);
     }
     let dt_max = anchors_a
         .iter()
@@ -405,11 +409,15 @@ pub fn anchor_pairs_and_census(
             let t_ref = 0.5 * (a0.epoch + b0.epoch);
             let pair = Pair { t_ref, a: a0.point(), b: b0.point() };
             if let Some(c) = pair.scan_census(node, mu) {
-                out.push(((b0.epoch - a0.epoch).abs(), c));
+                let g = pair.guided_check(node, mu);
+                if !g.outcome_agrees {
+                    disagree.push(pair.clone());
+                }
+                out.push(((b0.epoch - a0.epoch).abs(), c, g));
             }
         }
     }
-    out
+    (out, disagree)
 }
 
 /// Why anchor pairs did not become candidates.
