@@ -40,7 +40,7 @@
 use nalgebra::Vector3;
 
 use crate::spherical_pair::{Node, Pair};
-use crate::spherical_pair_anchor::{Candidate, Obs, predict_hat};
+use crate::spherical_pair_anchor::{Candidate, Obs, anchor_frame, predict_hat_in};
 use crate::spherical_pair_index::chord_of_angle;
 
 use kiddo::SquaredEuclidean;
@@ -277,6 +277,13 @@ pub fn extend_candidate(
         .map(|v| v.night)
         .collect();
 
+    // ⭐ THE HOIST. Everything in `position_at` that does not depend on the epoch, built once
+    // instead of once per visit -- 2 of every 3 universal-Kepler solves in this loop, plus the
+    // radii, the two range quadratics and the in-plane frame. `None` here means `None` at every
+    // epoch, so the loop below decides exactly what it decided before, one `continue` at a time.
+    // See `SCOPE_c2_extend_no_kepler.md` §2 and `AnchorFrame`.
+    let frame = anchor_frame(&pair, node, cand.h, mu);
+
     let disc = std::f64::consts::PI * params.tolerance * params.tolerance;
     let mut out = Support {
         n_opportunities: 0,
@@ -290,7 +297,10 @@ pub fn extend_candidate(
         if params.exclude_anchor_nights && anchor_nights.contains(&v.night) {
             continue;
         }
-        let Some(pred) = predict_hat(&pair, node, cand.h, mu, v.epoch, &v.observer) else {
+        let Some(pred) = frame
+            .as_ref()
+            .and_then(|f| predict_hat_in(f, &pair, node, cand.h, mu, v.epoch, &v.observer))
+        else {
             continue;
         };
         if !v.contains(&pred) {

@@ -203,14 +203,43 @@ pub enum Reject {
 /// drift from it. The plane and the reference direction come from the two anchors, exactly as
 /// `state_from_solution` derives them, so the prediction is the same orbit continued.
 pub fn position_at(pair: &Pair, node: &Node, h: f64, mu: f64, t: f64) -> Option<Vector3<f64>> {
+    let frame = anchor_frame(pair, node, h, mu)?;
+    position_at_in(&frame, pair, node, h, mu, t)
+}
+
+/// The part of [`position_at`] that does not depend on `t`.
+///
+/// ⭐ Hoisted because Stage 4 asks for a position at EVERY visit epoch in the window, and two of
+/// `position_at`'s three `canonical_step` calls have no `t` in them: over this run's 283-visit
+/// window, 566 of the 849 universal-Kepler solves per candidate were recomputing two fixed
+/// values. See `SCOPE_c2_extend_no_kepler.md` §2.
+///
+/// 🔴 The move is BIT-EXACT and is meant to stay that way: same function, same arguments, in the
+/// same order, nothing reassociated. Its regression test is a candidate CSV that compares BYTE
+/// FOR BYTE with one from before the hoist -- not an approximate tolerance, which would let a
+/// real numerical change hide inside an "acceptable" difference.
+#[derive(Debug, Clone, Copy)]
+pub struct AnchorFrame {
+    /// Canonical state at anchor A's epoch. `swept_angle` measures the sweep from here.
+    s_a: CanonicalState,
+    /// In-plane basis built from the two anchor positions: `a_hat` along anchor A.
+    a_hat: Vector3<f64>,
+    t_hat: Vector3<f64>,
+}
+
+/// Build the `t`-invariant frame once, for reuse at many `t`.
+///
+/// Returns `None` in exactly the cases [`position_at`] returned `None` for a `t`-invariant
+/// reason; the `t`-dependent ones stay in [`position_at_in`]. A caller that gets `None` here
+/// gets `None` at every `t`, which is why the extension can hoist the call out of its loop
+/// without changing what any single visit decides.
+pub fn anchor_frame(pair: &Pair, node: &Node, h: f64, mu: f64) -> Option<AnchorFrame> {
     let s_a: CanonicalState = canonical_step(node, h, pair.a.epoch - pair.t_ref, mu)?;
     let s_b: CanonicalState = canonical_step(node, h, pair.b.epoch - pair.t_ref, mu)?;
-    let s_t: CanonicalState = canonical_step(node, h, t - pair.t_ref, mu)?;
 
     let r_a = hypot2(s_a.pos);
     let r_b = hypot2(s_b.pos);
-    let r_t = hypot2(s_t.pos);
-    if !(r_a > 0.0) || !(r_b > 0.0) || !(r_t > 0.0) {
+    if !(r_a > 0.0) || !(r_b > 0.0) {
         return None;
     }
     let p_a = range_quadratic(&pair.a.observer, &pair.a.rho_hat, r_a)?;
@@ -224,10 +253,26 @@ pub fn position_at(pair: &Pair, node: &Node, h: f64, mu: f64, t: f64) -> Option<
     let n_hat = n / nn;
     let a_hat = p_a / p_a.norm();
     let t_hat = n_hat.cross(&a_hat);
+    Some(AnchorFrame { s_a, a_hat, t_hat })
+}
 
+/// [`position_at`] with the `t`-invariant half already built.
+pub fn position_at_in(
+    frame: &AnchorFrame,
+    pair: &Pair,
+    node: &Node,
+    h: f64,
+    mu: f64,
+    t: f64,
+) -> Option<Vector3<f64>> {
+    let s_t: CanonicalState = canonical_step(node, h, t - pair.t_ref, mu)?;
+    let r_t = hypot2(s_t.pos);
+    if !(r_t > 0.0) {
+        return None;
+    }
     // sweep from anchor A to t, in the same sense the solve used
-    let d_nu = swept_angle(node, h, mu, &s_a, &s_t, t - pair.a.epoch);
-    Some(r_t * (d_nu.cos() * a_hat + d_nu.sin() * t_hat))
+    let d_nu = swept_angle(node, h, mu, &frame.s_a, &s_t, t - pair.a.epoch);
+    Some(r_t * (d_nu.cos() * frame.a_hat + d_nu.sin() * frame.t_hat))
 }
 
 /// Topocentric unit vector predicted at `t`, as seen from `observer`.
@@ -240,6 +285,25 @@ pub fn predict_hat(
     observer: &Vector3<f64>,
 ) -> Option<Vector3<f64>> {
     let p = position_at(pair, node, h, mu, t)?;
+    topocentric_hat(&p, observer)
+}
+
+/// [`predict_hat`] with the `t`-invariant half already built.
+pub fn predict_hat_in(
+    frame: &AnchorFrame,
+    pair: &Pair,
+    node: &Node,
+    h: f64,
+    mu: f64,
+    t: f64,
+    observer: &Vector3<f64>,
+) -> Option<Vector3<f64>> {
+    let p = position_at_in(frame, pair, node, h, mu, t)?;
+    topocentric_hat(&p, observer)
+}
+
+/// Reduce a barycentric position to the unit vector an observer sees.
+fn topocentric_hat(p: &Vector3<f64>, observer: &Vector3<f64>) -> Option<Vector3<f64>> {
     let geo = p - observer;
     let n = geo.norm();
     if !(n > 0.0) {
@@ -625,5 +689,63 @@ mod tests {
             anchor_pairs_and_solve(&obs, &a, &b, &truth.node, 3.0, mu(), sigma_cap, CHI2_CUT_DOF4);
         assert_eq!(cands.len() + tally.total(), 1, "every gated pair must be accounted for");
         assert_eq!(cands.len(), 1, "the true node should keep its own object");
+    }
+
+    /// 🔴 THE HOIST IS BIT-EXACT, and this is the test that keeps it so.
+    ///
+    /// `anchor_frame` + `position_at_in` must reproduce `position_at` to the LAST BIT at every
+    /// epoch -- compared with `to_bits`, not with a tolerance. The entire argument for hoisting
+    /// the `t`-invariant work out of Stage 4's loop is that nothing was recomputed differently
+    /// and nothing was reassociated; a tolerance test would let a real numerical change hide
+    /// inside an "acceptable" difference, which is exactly the class of silent drift this file
+    /// keeps finding. The end-to-end version of this check is a candidate CSV that compares byte
+    /// for byte (`_c2_hoist_regress*.yaml`); this is its unit-level guard.
+    #[test]
+    fn hoisted_frame_reproduces_position_at_bit_for_bit() {
+        let node = Node { r: 45.0, rdot: 1.0e-3 };
+        let h = 0.7 * crate::spherical_pair::h_max(&node, mu()).expect("node must be bound");
+        let (t_a, t_b) = (0.0, 20.0);
+        let pair = Pair {
+            t_ref: 0.5 * (t_a + t_b),
+            a: PairPoint {
+                epoch: t_a,
+                rho_hat: Vector3::new(0.0, 1.0, 0.05).normalize(),
+                observer: observer_at(t_a),
+            },
+            b: PairPoint {
+                epoch: t_b,
+                rho_hat: Vector3::new(0.02, 1.0, 0.05).normalize(),
+                observer: observer_at(t_b),
+            },
+        };
+        let frame = anchor_frame(&pair, &node, h, mu()).expect("the anchors must build a frame");
+
+        let mut compared = 0usize;
+        for k in 0..400 {
+            // well outside the anchor span in both directions: the hoist must not be exact only
+            // where the two anchors are.
+            let t = -60.0 + 0.4 * k as f64;
+            let direct = position_at(&pair, &node, h, mu(), t);
+            let hoisted = position_at_in(&frame, &pair, &node, h, mu(), t);
+            match (direct, hoisted) {
+                (Some(d), Some(x)) => {
+                    for i in 0..3 {
+                        assert_eq!(
+                            d[i].to_bits(),
+                            x[i].to_bits(),
+                            "component {i} at t = {t} differs: {} vs {}",
+                            d[i],
+                            x[i]
+                        );
+                    }
+                    compared += 1;
+                }
+                (None, None) => {}
+                (d, x) => panic!("one path produced a position and the other did not at t = {t}: \
+                                  {d:?} vs {x:?}"),
+            }
+        }
+        // 🔴 A test that compared nothing would pass. Assert it actually ran.
+        assert!(compared > 300, "only {compared} epochs produced a position; the fixture is wrong");
     }
 }
