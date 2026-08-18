@@ -41,6 +41,7 @@
 //! operating point, not 0.997.
 
 use nalgebra::Vector3;
+use rayon::prelude::*;
 
 use crate::spherical_pair::{
     CanonicalState, GuidedCheck, Node, Pair, PairPoint, ScanCensus, Solution, canonical_step,
@@ -405,16 +406,42 @@ pub fn anchor_pairs_and_solve(
     let ia = pack(anchors_a);
     let ib = pack(anchors_b);
 
-    for (slot, p) in ia.points.iter().enumerate() {
-        let q = Vector3::new(p[0], p[1], p[2]);
-        for hit in ib.within_idx(&q, cap) {
-            let a = anchors_a[ia.ids[slot] as usize];
-            let b = anchors_b[ib.ids[hit] as usize];
-            match solve_anchor_pair(obs, a, b, node, mu, chi2_cut) {
-                Ok(c) => out.push(c),
-                Err(e) => tally.count(e),
+    // ⭐ PARALLEL OVER SLOTS. Each slot queries the same immutable index and solves its own
+    // pairs, touching nothing another slot touches. This is the granularity the search needs:
+    // the cost per NIGHT-PAIR is wildly skewed (on the full-arc ladder ~12 of 91 night-pairs
+    // carry the node), so parallelising a level up leaves most threads idle waiting on one pair.
+    //
+    // 🔴 `collect` on an indexed parallel iterator preserves ORDER, and the flatten below keeps
+    // it, so the candidate sequence -- and therefore the output file -- is exactly the serial
+    // one. That is not a nicety: byte-comparison against the previous build is this lane's only
+    // defence against a silent numerical change, and unordered output forfeits it.
+    //
+    // ⚠️ Do NOT reach for the cheaper-looking version of this and split `anchors_a` into slices
+    // across threads. `dt_max`, and therefore `cap`, is a property of the WHOLE pair of sets; a
+    // slice would compute a smaller one and gate NARROWER, which silently drops real pairs
+    // rather than merely reordering them. Split after the gate is fixed, never before.
+    let per_slot: Vec<(Vec<Candidate>, RejectTally)> = ia
+        .points
+        .par_iter()
+        .enumerate()
+        .map(|(slot, p)| {
+            let mut cands = Vec::new();
+            let mut t = RejectTally::default();
+            let q = Vector3::new(p[0], p[1], p[2]);
+            for hit in ib.within_idx(&q, cap) {
+                let a = anchors_a[ia.ids[slot] as usize];
+                let b = anchors_b[ib.ids[hit] as usize];
+                match solve_anchor_pair(obs, a, b, node, mu, chi2_cut) {
+                    Ok(c) => cands.push(c),
+                    Err(e) => t.count(e),
+                }
             }
-        }
+            (cands, t)
+        })
+        .collect();
+    for (cands, t) in per_slot {
+        out.extend(cands);
+        tally.absorb(&t);
     }
     (out, tally)
 }
@@ -503,6 +530,16 @@ impl RejectTally {
             Reject::NoPrediction => self.no_prediction += 1,
             Reject::Chi2 { .. } => self.chi2 += 1,
         }
+    }
+
+    /// Fold another tally in. Needed because the slot loop counts rejections per thread; a
+    /// shared counter would be a lock on the hot path, which is the thing being removed.
+    pub fn absorb(&mut self, o: &RejectTally) {
+        self.unbound_node += o.unbound_node;
+        self.no_bound_root += o.no_bound_root;
+        self.no_state += o.no_state;
+        self.no_prediction += o.no_prediction;
+        self.chi2 += o.chi2;
     }
 
     pub fn total(&self) -> usize {

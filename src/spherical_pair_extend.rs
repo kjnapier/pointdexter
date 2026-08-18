@@ -61,6 +61,10 @@ pub struct VisitIndex {
     /// Centre and angular radius of the detections actually present, used as the footprint.
     pub centre: Vector3<f64>,
     pub radius: f64,
+    /// `ids`, sorted, for membership tests. See [`Self::contains_id`].
+    ids_sorted: Vec<u32>,
+    /// [`Self::density`], evaluated once.
+    density: f64,
 }
 
 impl VisitIndex {
@@ -92,6 +96,11 @@ impl VisitIndex {
             members.iter().map(|&i| [obs[i].rho_hat.x, obs[i].rho_hat.y, obs[i].rho_hat.z]).collect();
         let ids: Vec<u32> = members.iter().map(|&i| obs[i].id).collect();
         let tree = ImmutableKdTree::new_from_slice(&points);
+        let mut ids_sorted = ids.clone();
+        ids_sorted.sort_unstable();
+        // The same expression `density()` evaluated, on the same inputs, so the same bits.
+        let omega = 2.0 * std::f64::consts::PI * (1.0 - radius.cos());
+        let density = if omega > 0.0 { points.len() as f64 / omega } else { 0.0 };
         Some(VisitIndex {
             tree,
             points,
@@ -101,6 +110,8 @@ impl VisitIndex {
             observer: obs[members[0]].observer,
             centre,
             radius,
+            ids_sorted,
+            density,
         })
     }
 
@@ -114,14 +125,27 @@ impl VisitIndex {
 
     /// Does this visit contain that detection? Exact id membership, not an epoch comparison:
     /// the anchor nights are derived from this, and a float epoch is not a key.
+    ///
+    /// ⭐ Binary search over a SORTED COPY of the ids, not `ids.contains`. `extend_candidate`
+    /// asks this of every visit for each of a candidate's four anchor detections, so a linear
+    /// scan is 283 visits x 4 ids x ~3,600 detections PER CANDIDATE -- and a profile of the
+    /// 8-night fixture put it at 23% of the whole binary's runtime, the single largest entry,
+    /// ahead of the universal-Kepler solver. Same answer, ~300x fewer comparisons.
+    ///
+    /// 🔴 A separate vector, because `ids` is positionally parallel to `points` and to the
+    /// tree's own indices; sorting it in place would silently re-label every detection the
+    /// gather returns.
     pub fn contains_id(&self, id: u32) -> bool {
-        self.ids.contains(&id)
+        self.ids_sorted.binary_search(&id).is_ok()
     }
 
     /// Detection surface density over the footprint [per steradian].
+    ///
+    /// ⭐ Precomputed at build time. It is a function of the visit alone, but the extension asked
+    /// for it once per candidate per opportunity -- a `cos` and a divide each time, and `sincos`
+    /// was 13% of the profiled run. Same expression on the same inputs, so the same bits.
     pub fn density(&self) -> f64 {
-        let omega = 2.0 * std::f64::consts::PI * (1.0 - self.radius.cos());
-        if omega > 0.0 { self.len() as f64 / omega } else { 0.0 }
+        self.density
     }
 
     fn contains(&self, u: &Vector3<f64>) -> bool {

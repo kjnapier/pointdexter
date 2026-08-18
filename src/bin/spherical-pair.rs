@@ -24,9 +24,11 @@
 //! `--self-check` exercises the projection, the index and the gate on synthetic geometry, so the
 //! stage is runnable and provably wired before any of that exists.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Parser;
+use rayon::prelude::*;
 use nalgebra::Vector3;
 use serde::{Deserialize, Serialize};
 use spacerocks::coordinates::Origin;
@@ -48,6 +50,11 @@ use pointdexter::spherical_pair_grid::{
     Geometry, GridError, Stat, build_ladder, summarize,
 };
 use pointdexter::spherical_pair_load::{ObsSet, SigmaSource};
+
+/// Candidates per extension task. Large enough that the per-task overhead and the `csv::Writer`
+/// allocation are amortised, small enough that a night-pair still yields thousands of tasks for
+/// rayon to balance.
+const CANDIDATE_CHUNK: usize = 512;
 
 const ARCSEC: f64 = std::f64::consts::PI / (180.0 * 3600.0);
 
@@ -647,11 +654,19 @@ fn run_search(
         max_chance_probability: cfg.extension.max_chance_probability,
     };
 
-    let mut writer = csv::Writer::from_path(&cfg.io.output)?;
-    writer.write_record([
-        "r_au", "rdot", "night_a", "night_b", "chi2", "n_opp", "n_support", "lambda", "p_chance",
-        "accepted", "epoch", "h", "x", "y", "z", "vx", "vy", "vz",
-    ])?;
+    // 🔴 Opened BEFORE the node loop, exactly as it always was: a diagnostic pointed at a live
+    // config's output truncates that file, which is why the diagnostic configs in this lane each
+    // differ from a live one in the `io.output` line.
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&cfg.io.output)?);
+    {
+        // Header through `csv::Writer` so its quoting is the same code that writes the rows.
+        let mut hdr = csv::Writer::from_writer(Vec::new());
+        hdr.write_record([
+            "r_au", "rdot", "night_a", "night_b", "chi2", "n_opp", "n_support", "lambda",
+            "p_chance", "accepted", "epoch", "h", "x", "y", "z", "vx", "vy", "vz",
+        ])?;
+        out.write_all(&hdr.into_inner()?)?;
+    }
 
     // ---- the (r, rdot) node set -------------------------------------------------------------
     let specs: Vec<(NodeSpec, f64)> = if cfg.data.explicit_nodes.is_empty() {
@@ -766,103 +781,143 @@ fn run_search(
         let mut accepted = 0usize;
         let mut supported = 0usize;
         let mut tally = pointdexter::spherical_pair_anchor::RejectTally::default();
+        // ⭐ The night-pair work list, materialised so it can be handed to rayon. Same baseline
+        // test as the serial loop applied, in the same place, in the same i < j order.
+        let mut pair_ix: Vec<(usize, usize)> = Vec::new();
         for i in 0..per_night.len() {
             for j in (i + 1)..per_night.len() {
-                let (ka, aa) = (&per_night[i].0, &per_night[i].1);
-                let (kb, ab) = (&per_night[j].0, &per_night[j].1);
-                let dt_days = (set.obs[ab[0].first].epoch - set.obs[aa[0].first].epoch).abs();
-                if dt_days > cfg.anchor.max_anchor_baseline_days {
-                    continue;
+                let dt_days = (set.obs[per_night[j].1[0].first].epoch
+                    - set.obs[per_night[i].1[0].first].epoch)
+                    .abs();
+                if dt_days <= cfg.anchor.max_anchor_baseline_days {
+                    pair_ix.push((i, j));
                 }
-                if sign_census {
-                    // 🔴 Same gate, same pairs, no solve. See anchor_pairs_and_census.
-                    let (census_rows, disagreeing) =
-                        pointdexter::spherical_pair_anchor::anchor_pairs_and_census(
-                            &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap,
-                        );
-                    guided_disagree_pairs.extend(disagreeing);
-                    for (dt_days, c, g) in census_rows {
-                        census_pairs += 1;
-                        *census_hist.entry(c.sign_changes).or_insert(0usize) += 1;
-                        guided_ns_scan += g.ns_scan;
-                        guided_ns_guided += g.ns_guided;
-                        if !g.outcome_agrees {
-                            guided_outcome_diff += 1;
-                        }
-                        if g.rel_diff.is_finite() {
-                            guided_rel.push(g.rel_diff);
-                        }
-                        if g.scan_bound {
-                            guided_ns_scan_rooted += g.ns_scan;
-                            guided_ns_guided_rooted += g.ns_guided;
-                            guided_rooted += 1;
-                        }
-                        if c.segments > 1 {
-                            census_fragmented += 1;
-                        }
-                        if c.sign_changes == 1 {
-                            // 🔴 Against the CONVERGED root, never the bracket centre -- the
-                            // bracket is ~1.19x wide, so the centre measures the grid and
-                            // reports +-9% for a perfect guess. Ratio, not difference: h spans
-                            // decades across the scan.
-                            if c.h_guess_frac.is_finite() && c.root_frac > 0.0 {
-                                census_ratio.push(c.h_guess_frac / c.root_frac);
-                            } else {
-                                census_no_guess += 1;
-                            }
-                        }
-                        if c.sign_changes >= 2 {
-                            // Keep the spread: how far apart the roots a guess must choose
-                            // between actually are, in the units a guess would be expressed in.
-                            census_multi.push((
-                                dt_days,
-                                c.sign_changes,
-                                c.first_bracket_frac,
-                                c.last_bracket_frac,
-                            ));
+            }
+        }
+
+        if sign_census {
+            // 🔴 The census stays SERIAL. Its accumulators are order-dependent (`census_multi`,
+            // `census_ratio`, the disagreeing-pair list), it is a diagnostic that runs on demand,
+            // and it never writes the candidate file.
+            for &(i, j) in &pair_ix {
+                let (aa, ab) = (&per_night[i].1, &per_night[j].1);
+                // 🔴 Same gate, same pairs, no solve. See anchor_pairs_and_census.
+                let (census_rows, disagreeing) =
+                    pointdexter::spherical_pair_anchor::anchor_pairs_and_census(
+                        &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap,
+                    );
+                guided_disagree_pairs.extend(disagreeing);
+                for (dt_days, c, g) in census_rows {
+                    census_pairs += 1;
+                    *census_hist.entry(c.sign_changes).or_insert(0usize) += 1;
+                    guided_ns_scan += g.ns_scan;
+                    guided_ns_guided += g.ns_guided;
+                    if !g.outcome_agrees {
+                        guided_outcome_diff += 1;
+                    }
+                    if g.rel_diff.is_finite() {
+                        guided_rel.push(g.rel_diff);
+                    }
+                    if g.scan_bound {
+                        guided_ns_scan_rooted += g.ns_scan;
+                        guided_ns_guided_rooted += g.ns_guided;
+                        guided_rooted += 1;
+                    }
+                    if c.segments > 1 {
+                        census_fragmented += 1;
+                    }
+                    if c.sign_changes == 1 {
+                        // 🔴 Against the CONVERGED root, never the bracket centre -- the
+                        // bracket is ~1.19x wide, so the centre measures the grid and
+                        // reports +-9% for a perfect guess. Ratio, not difference: h spans
+                        // decades across the scan.
+                        if c.h_guess_frac.is_finite() && c.root_frac > 0.0 {
+                            census_ratio.push(c.h_guess_frac / c.root_frac);
+                        } else {
+                            census_no_guess += 1;
                         }
                     }
-                    continue;
+                    if c.sign_changes >= 2 {
+                        // Keep the spread: how far apart the roots a guess must choose
+                        // between actually are, in the units a guess would be expressed in.
+                        census_multi.push((
+                            dt_days,
+                            c.sign_changes,
+                            c.first_bracket_frac,
+                            c.last_bracket_frac,
+                        ));
+                    }
                 }
+            }
+        } else {
+            // ⭐ Night-pairs run in ORDER, one at a time. The parallelism lives one level down --
+            // inside `anchor_pairs_and_solve` over index slots, and over candidates here -- because
+            // the cost per night-pair is heavily skewed: measured on the full-arc ladder, the first
+            // 8 of node 1's 91 pairs emit 2.4 MB of its 4.1 GB, and ~12 pairs carry the node. Fan
+            // out ACROSS pairs and 64 threads collapse to ~9 busy ones waiting on the heaviest.
+            //
+            // Sequential pairs also bound memory to one pair's rows and keep the output file in
+            // exactly the order the serial loop wrote it.
+            for &(i, j) in &pair_ix {
+                let (ka, aa) = (&per_night[i].0, &per_night[i].1);
+                let (kb, ab) = (&per_night[j].0, &per_night[j].1);
                 let (cands, t) = anchor_pairs_and_solve(
                     &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap, cfg.anchor.chi2_max,
                 );
-                tally.unbound_node += t.unbound_node;
-                tally.no_bound_root += t.no_bound_root;
-                tally.no_state += t.no_state;
-                tally.no_prediction += t.no_prediction;
-                tally.chi2 += t.chi2;
                 candidates += cands.len();
                 // 🔴 report the GATED count too. Without it "0 candidates, 0 rejected" cannot
                 // distinguish "the gate admitted no pairs" from "every pair failed chi2" -- which
                 // is the exact confusion the module docs warn about, and this binary had it.
                 gated += cands.len() + t.total();
-                for c in cands {
-                    let sup = extend_candidate(&set.obs, &c, &node, mu, &visit_index, &params);
-                    if sup.accepted {
-                        accepted += 1;
-                    }
-                    supported += usize::from(sup.n_support > 0);
-                    writer.write_record([
-                        format!("{}", spec.r_au),
-                        format!("{}", spec.rdot_au_per_day),
-                        format!("{ka}"),
-                        format!("{kb}"),
-                        format!("{:.6}", c.chi2),
-                        format!("{}", sup.n_opportunities),
-                        format!("{}", sup.n_support),
-                        format!("{:.6}", sup.lambda),
-                        format!("{:.6e}", sup.p_chance),
-                        format!("{}", sup.accepted),
-                        format!("{:.9}", c.epoch),
-                        format!("{:.12e}", c.h),
-                        format!("{:.12e}", c.state[0]),
-                        format!("{:.12e}", c.state[1]),
-                        format!("{:.12e}", c.state[2]),
-                        format!("{:.12e}", c.state[3]),
-                        format!("{:.12e}", c.state[4]),
-                        format!("{:.12e}", c.state[5]),
-                    ])?;
+                tally.absorb(&t);
+
+                // Extension is the tall pole per candidate, and candidates are independent.
+                // Chunked so the per-task overhead is amortised and each task's rows share one
+                // in-memory `csv::Writer` -- the same writer type, so quoting and escaping stay
+                // the code that wrote every existing candidate file.
+                let parts: Vec<(Vec<u8>, usize, usize)> = cands
+                    .par_chunks(CANDIDATE_CHUNK)
+                    .map(|chunk| {
+                        let mut w = csv::Writer::from_writer(Vec::new());
+                        let (mut acc, mut sup_n) = (0usize, 0usize);
+                        for c in chunk {
+                            let sup = extend_candidate(
+                                &set.obs, c, &node, mu, &visit_index, &params,
+                            );
+                            if sup.accepted {
+                                acc += 1;
+                            }
+                            sup_n += usize::from(sup.n_support > 0);
+                            w.write_record([
+                                format!("{}", spec.r_au),
+                                format!("{}", spec.rdot_au_per_day),
+                                format!("{ka}"),
+                                format!("{kb}"),
+                                format!("{:.6}", c.chi2),
+                                format!("{}", sup.n_opportunities),
+                                format!("{}", sup.n_support),
+                                format!("{:.6}", sup.lambda),
+                                format!("{:.6e}", sup.p_chance),
+                                format!("{}", sup.accepted),
+                                format!("{:.9}", c.epoch),
+                                format!("{:.12e}", c.h),
+                                format!("{:.12e}", c.state[0]),
+                                format!("{:.12e}", c.state[1]),
+                                format!("{:.12e}", c.state[2]),
+                                format!("{:.12e}", c.state[3]),
+                                format!("{:.12e}", c.state[4]),
+                                format!("{:.12e}", c.state[5]),
+                            ])
+                            .expect("writing a record into a Vec cannot fail");
+                        }
+                        let buf = w.into_inner().expect("flushing a Vec writer cannot fail");
+                        (buf, acc, sup_n)
+                    })
+                    .collect();
+                for (buf, acc, sup_n) in parts {
+                    out.write_all(&buf)?;
+                    accepted += acc;
+                    supported += sup_n;
                 }
             }
         }
@@ -999,7 +1054,7 @@ fn run_search(
             cfg.extension.chance_dispersion
         );
     }
-    writer.flush()?;
+    out.flush()?;
     println!("candidates written to {}", cfg.io.output.display());
     Ok(())
 }
