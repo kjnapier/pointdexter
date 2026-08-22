@@ -195,6 +195,14 @@ struct Extension {
     /// 🔴 Support on the anchors' own nights is nearly free (it confirms the detection, not the
     /// orbit) and the shift control endorses it. Keep true unless deliberately measuring that.
     exclude_anchor_nights: bool,
+    /// Also write `support_ids`, the ids of the supporting detections themselves.
+    ///
+    /// 🔴 `#[serde(default)]` = false. The four ANCHOR ids are always written -- fixed width, and
+    /// they are what subset/duplicate dedup needs -- but the support list is VARIABLE length over
+    /// tens of millions of rows, and this lane has already filled a 300 GB `/lscratch` once. Turn
+    /// it on for a run that needs full track membership, not by default.
+    #[serde(default)]
+    emit_support_ids: bool,
     /// Require the support to come from TRACKLETS: cross-nights carrying support in two or more
     /// distinct visits. 0 is off and leaves acceptance exactly as before.
     ///
@@ -699,6 +707,15 @@ fn run_search(
             // this lane uses -- the awk diagnostics index $6..$9 -- so a new column in the middle
             // would silently re-point them at the wrong quantity on new files only.
             "n_sup_nights", "n_sup_tracklets", "lambda_tracklet", "p_chance_tracklet",
+            // 🔴 APPENDED AGAIN, same reasoning: 1-18 then 19-22 are load-bearing positions.
+            // These five are the detection PROVENANCE the escalation needs -- without them
+            // PS1-style subset dedup is not computable from this file at all, which is what
+            // NOTE_c2_ps1_escalation_lineage.md flags as the prerequisite for its fit tier.
+            // ⚠️ ids are `Obs::id`, i.e. the ROW INDEX in `io.detections`, NOT a survey detId --
+            // `Detection` carries `detid`, but `Obs` does not, so the survey id is recovered by
+            // joining these back on that file's row order. They are therefore meaningless without
+            // the exact export that produced them, and a re-export renumbers every one of them.
+            "a0_id", "a1_id", "b0_id", "b1_id", "support_ids",
         ])?;
         out.write_all(&hdr.into_inner()?)?;
     }
@@ -947,6 +964,25 @@ fn run_search(
                                 format!("{}", sup.n_support_tracklets),
                                 format!("{:.6}", sup.lambda_tracklet),
                                 format!("{:.6e}", sup.p_chance_tracklet),
+                                // 🔴 `anchor_a`/`anchor_b` index `set.obs`; `.id` maps back to the
+                                // input row. The two are NOT interchangeable -- the loader skips
+                                // detections without a sigma or with bad geometry, so obs position
+                                // and input row diverge as soon as anything is dropped.
+                                format!("{}", set.obs[c.anchor_a.first].id),
+                                format!("{}", set.obs[c.anchor_a.second].id),
+                                format!("{}", set.obs[c.anchor_b.first].id),
+                                format!("{}", set.obs[c.anchor_b.second].id),
+                                if cfg.extension.emit_support_ids {
+                                    // Space-separated inside one field: `csv` quotes it, so it
+                                    // survives a reader that splits on commas.
+                                    sup.support_ids
+                                        .iter()
+                                        .map(|i| i.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                } else {
+                                    String::new()
+                                },
                             ])
                             .expect("writing a record into a Vec cannot fail");
                         }
