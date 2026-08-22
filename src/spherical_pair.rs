@@ -448,6 +448,11 @@ pub(crate) const FG_NODES: usize = 9;
 /// How far the bracket search may double before giving up.
 const FG_MAX_EXPAND: usize = 60;
 
+/// Bisection steps used to tighten each end of the window, inside a bracket already known to a
+/// factor of two. 20 halvings is ~1e-6 relative, far past what a window BOUND needs -- the fit
+/// only has to contain the evaluation range, not match it exactly.
+const FG_BISECT_STEPS: usize = 20;
+
 /// A degree-8 polynomial interpolant for the canonical `f` and `g` over one time window.
 ///
 /// ⭐ THE POINT: `canonical_step` costs an iterative universal-Kepler solve, and the support stage
@@ -469,6 +474,9 @@ pub(crate) struct FgInterp {
     g: [f64; FG_NODES],
     /// Barycentric weights for `x`.
     w: [f64; FG_NODES],
+    /// The universal-anomaly abscissae the nodes were sampled at. Kept so `spot_check` can probe
+    /// BETWEEN two nodes without inverting `t -> s`.
+    s: [f64; FG_NODES],
     t_mid: f64,
     t_half: f64,
 }
@@ -515,10 +523,18 @@ impl FgInterp {
         }
         // `dt(s)` is strictly increasing -- `d(dt)/ds = r(s)/sqrt(mu) > 0` -- so a doubling search
         // brackets it, and `dt(0) = 0` gives the seed side for free.
+        // ⭐ Keep the PREVIOUS doubling step, so the bisection below starts from a bracket only a
+        // factor of two wide instead of from zero. Same tightness for a third of the iterations,
+        // and better precision: 20 halvings of a 2x bracket is ~1e-6 relative, where 30 halvings
+        // measured from zero was both slower and coarser.
+        let pad = 0.02 * (t_hi - t_lo).abs().max(1.0);
         let seed = (mu.sqrt() * t_hi.abs().max(t_lo.abs()) / node.r).abs().max(1.0);
+
         let mut s_hi = seed;
+        let mut s_hi_prev = 0.0;
         let mut n = 0;
-        while fg_at_s(node, mu, alpha, s_hi).0 < t_hi {
+        while fg_at_s(node, mu, alpha, s_hi).0 < t_hi + pad {
+            s_hi_prev = s_hi;
             s_hi *= 2.0;
             n += 1;
             if n > FG_MAX_EXPAND || !s_hi.is_finite() {
@@ -526,8 +542,10 @@ impl FgInterp {
             }
         }
         let mut s_lo = -seed;
+        let mut s_lo_prev = 0.0;
         n = 0;
-        while fg_at_s(node, mu, alpha, s_lo).0 > t_lo {
+        while fg_at_s(node, mu, alpha, s_lo).0 > t_lo - pad {
+            s_lo_prev = s_lo;
             s_lo *= 2.0;
             n += 1;
             if n > FG_MAX_EXPAND || !s_lo.is_finite() {
@@ -545,17 +563,17 @@ impl FgInterp {
         // step is one Stumpff evaluation, not a universal-Kepler solve with polish. ~30 of them
         // once per candidate against ~165 Kepler solves per candidate is noise.
         let tighten = |target: f64, mut lo: f64, mut hi: f64| -> f64 {
-            for _ in 0..30 {
+            for _ in 0..FG_BISECT_STEPS {
                 let m = 0.5 * (lo + hi);
                 if fg_at_s(node, mu, alpha, m).0 < target { lo = m } else { hi = m }
             }
             0.5 * (lo + hi)
         };
-        // Keep a sliver of margin outside the window so every evaluation point stays INTERIOR --
-        // Table 2's failure mode is evaluating outside the fit interval, which is superexponential.
-        let pad = 0.02 * (t_hi - t_lo).abs().max(1.0);
-        s_hi = tighten(t_hi + pad, 0.0_f64.min(s_lo), s_hi);
-        s_lo = tighten(t_lo - pad, s_lo, 0.0_f64.max(s_hi));
+        // The `pad` above keeps a sliver of margin outside the window so every evaluation point
+        // stays INTERIOR -- Table 2's failure mode is evaluating outside the fit interval, which is
+        // superexponential, not merely larger.
+        s_hi = tighten(t_hi + pad, s_hi_prev, s_hi);
+        s_lo = tighten(t_lo - pad, s_lo, s_lo_prev);
 
         // Chebyshev-LOBATTO in `s`: includes both endpoints, unlike Chebyshev-Gauss, so the
         // window edges are interpolated rather than extrapolated.
@@ -564,8 +582,10 @@ impl FgInterp {
         let mut ts = [0.0; FG_NODES];
         let mut f = [0.0; FG_NODES];
         let mut g = [0.0; FG_NODES];
+        let mut s_nodes = [0.0; FG_NODES];
         for k in 0..FG_NODES {
             let s_k = mid + half * (std::f64::consts::PI * (k as f64) / ((FG_NODES - 1) as f64)).cos();
+            s_nodes[k] = s_k;
             let (dt_k, f_k, g_k) = fg_at_s(node, mu, alpha, s_k);
             if !dt_k.is_finite() || !f_k.is_finite() || !g_k.is_finite() {
                 return None;
@@ -607,7 +627,7 @@ impl FgInterp {
             w[j] = 1.0 / prod;
         }
 
-        Some(FgInterp { x, f, g, w, t_mid, t_half })
+        Some(FgInterp { x, f, g, w, s: s_nodes, t_mid, t_half })
     }
 
     /// `(f, g)` at `dt` from `t_ref`. Two barycentric evaluations, no Kepler solve.
@@ -636,36 +656,14 @@ impl FgInterp {
     /// verify per candidate, fall back to the exact path when it fails.
     pub(crate) fn spot_check(&self, node: &Node, h: f64, mu: f64, tol_rel: f64) -> bool {
         let alpha = alpha_of(node, h, mu);
-        // Between two interior nodes in `s`-space the polynomial is least constrained; take the
-        // midpoint of the two central `x` nodes, mapped back through the exact relation.
+        // ⭐ Probe BETWEEN two nodes, in `s`, and take the exact `(t, f, g)` from the same closed
+        // form -- ONE `fg_at_s` call. An earlier version bisected `dt(s)` to find the `s` matching
+        // a chosen `t`, which is the expensive `t -> s` direction this whole scheme exists to
+        // avoid, and cost ~85 evaluations per candidate to learn nothing extra. `fg_at_s` returns
+        // the time alongside the values, so the probe simply reports where it landed.
         let j = FG_NODES / 2;
-        let x_probe = 0.5 * (self.x[j] + self.x[j - 1]);
-        let t_probe = x_probe * self.t_half + self.t_mid;
-        // The exact side needs `s(t_probe)`, which is the direction we avoid -- so instead probe
-        // in `s`: take the `s` midpoint of those same two nodes and compare AT ITS OWN t.
-        let s_mid = {
-            // recover the s bracket from the node abscissae is not possible directly, so redo the
-            // cheap closed-form scan: bisect dt(s) = t_probe. dt is monotone, so this is safe and
-            // costs a handful of Stumpff evaluations -- still no root-find on the hot path.
-            let mut lo = -1.0f64;
-            let mut hi = 1.0f64;
-            let mut n = 0;
-            while fg_at_s(node, mu, alpha, hi).0 < t_probe && n < FG_MAX_EXPAND {
-                hi *= 2.0;
-                n += 1;
-            }
-            n = 0;
-            while fg_at_s(node, mu, alpha, lo).0 > t_probe && n < FG_MAX_EXPAND {
-                lo *= 2.0;
-                n += 1;
-            }
-            for _ in 0..40 {
-                let m = 0.5 * (lo + hi);
-                if fg_at_s(node, mu, alpha, m).0 < t_probe { lo = m } else { hi = m }
-            }
-            0.5 * (lo + hi)
-        };
-        let (t_exact, f_exact, g_exact) = fg_at_s(node, mu, alpha, s_mid);
+        let s_probe = 0.5 * (self.s[j] + self.s[j - 1]);
+        let (t_exact, f_exact, g_exact) = fg_at_s(node, mu, alpha, s_probe);
         if !t_exact.is_finite() || !f_exact.is_finite() || !g_exact.is_finite() {
             return false;
         }
