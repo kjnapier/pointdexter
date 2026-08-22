@@ -177,6 +177,16 @@ pub struct ExtendParams {
     pub min_support: usize,
     /// Accept only if chance would produce this much support with probability below this.
     pub max_chance_probability: f64,
+    /// Require this many supporting **tracklets** -- cross-nights carrying support in two or more
+    /// distinct visits. 0 leaves acceptance exactly as it was.
+    ///
+    /// MJH, 2026-08-18, from the PS1 pipeline: the anchor is already a pair of detections, so ask
+    /// the support to be a pair too. The motivation is measured -- at a 10" gather over ~160
+    /// opportunities the chance support count is over-dispersed at var/mean 7.4, and the tail is
+    /// heavy enough that no threshold on a count of SINGLE detections reaches discovery grade
+    /// (>= 20 still keeps 0.38% of candidates). Two detections in one night must both fall in the
+    /// disc, so the chance rate is a product rather than a sum.
+    pub min_support_tracklets: usize,
 }
 
 /// What the extension found for one candidate.
@@ -191,6 +201,25 @@ pub struct Support {
     pub p_chance: f64,
     pub support_ids: Vec<u32>,
     pub accepted: bool,
+    /// Cross-nights carrying at least one supporting detection.
+    pub n_support_nights: usize,
+    /// Cross-nights carrying support in **two or more distinct visits** -- a supporting tracklet.
+    ///
+    /// 🔴 Distinct VISITS, not detections. Two detections of the same source in one visit are a
+    /// blend or a duplicate, not a tracklet, and counting them would readmit the same-night
+    /// confirmation channel `exclude_anchor_nights` exists to shut.
+    pub n_support_tracklets: usize,
+    /// Expected number of chance supporting tracklets, exactly under the model `lambda` uses:
+    /// per night, `P(>= 2 of its opportunity visits carry a chance detection)`.
+    pub lambda_tracklet: f64,
+    /// `P(>= n_support_tracklets)` under the same over-dispersed tail.
+    ///
+    /// ⚠️ It reuses `dispersion`, which was calibrated for the count of single detections. The
+    /// clustering that fattens that tail is largely STATIC sources, which do not reappear at the
+    /// prediction on a later visit as an object would -- so this is likely conservative. It is
+    /// not measured, and the tracklet counts are reported so the empirical rate can be read off
+    /// the run rather than taken from the model.
+    pub p_chance_tracklet: f64,
 }
 
 /// `ln Gamma(x)` for `x > 0`, Lanczos g = 7, n = 9.
@@ -258,6 +287,68 @@ pub fn chance_probability(k: usize, lambda: f64, dispersion: f64) -> f64 {
     (1.0 - cdf).clamp(0.0, 1.0)
 }
 
+/// Per-night support, for the tracklet statistic: how many nights carried support in two or more
+/// distinct visits, and how many such nights chance alone would have produced.
+///
+/// A `Vec` with a linear probe rather than a map: a candidate sees tens of nights, this is the
+/// hot loop, and an allocation per candidate is what the parallel port exists to avoid.
+#[derive(Default)]
+struct NightTally {
+    /// night, opportunity visits, visits that carried support, `sum ln(1 - e_v)`,
+    /// `sum e_v / (1 - e_v)`.
+    nights: Vec<(i64, usize, usize, f64, f64)>,
+}
+
+impl NightTally {
+    /// One opportunity visit: its night, its chance rate `p_v`, and whether it carried support.
+    fn observe(&mut self, night: i64, p_v: f64, had_support: bool) {
+        // e_v = P(this visit carries >= 1 chance detection in the disc), from the same Poisson
+        // rate `lambda` is built from -- so this is not a second model of the same sky.
+        // `exp_m1` rather than `1 - exp(-p)`: p_v is ~1e-4 here and the subtraction would throw
+        // away most of the significant digits.
+        let e_v = (-p_v).exp_m1().abs().min(1.0 - 1e-12);
+        let slot = match self.nights.iter().position(|n| n.0 == night) {
+            Some(i) => &mut self.nights[i],
+            None => {
+                self.nights.push((night, 0, 0, 0.0, 0.0));
+                self.nights.last_mut().expect("just pushed")
+            }
+        };
+        slot.1 += 1;
+        slot.2 += usize::from(had_support);
+        slot.3 += (-e_v).ln_1p();
+        slot.4 += e_v / (1.0 - e_v);
+    }
+
+    /// `(nights with any support, nights with a supporting tracklet, expected chance tracklets)`.
+    fn finish(&self) -> (usize, usize, f64) {
+        let mut n_nights = 0;
+        let mut n_tracklets = 0;
+        let mut lambda = 0.0;
+        for &(_, n_opp, vis_with_support, ln_none, sum_odds) in &self.nights {
+            n_nights += usize::from(vis_with_support >= 1);
+            n_tracklets += usize::from(vis_with_support >= 2);
+            // 🔴 STRUCTURAL, not arithmetic: a night with fewer than two opportunity visits
+            // cannot produce a chance tracklet, so it contributes exactly zero rather than
+            // whatever the formula rounds to. ~58% of Rubin position-nights get one visit, so a
+            // 1e-20 per night would accumulate across the survey as a real-looking rate.
+            if n_opp < 2 {
+                continue;
+            }
+            // P(>= 2 hit) = 1 - P(none) - P(exactly one)
+            //            = 1 - prod(1-e) * (1 + sum e/(1-e))
+            //            = -expm1( ln1p(sum e/(1-e)) + sum ln1p(-e) ).
+            // 🔴 The last form is the one to implement. The middle form subtracts two numbers
+            // near 1 to produce an answer near 2e-8 at this field's rates -- eight of sixteen
+            // digits gone, and a brute-force enumeration over subsets caught it at 5e-9 relative.
+            // In log space both terms are small and nearly cancel *before* the exponential, so
+            // the leading `sum_{i<j} e_i e_j` survives at full precision.
+            lambda += (-((sum_odds.ln_1p() + ln_none).exp_m1())).clamp(0.0, 1.0);
+        }
+        (n_nights, n_tracklets, lambda)
+    }
+}
+
 /// Gather support for one candidate over the supplied visits.
 ///
 /// `visits` should be every visit in the extension window; the ones the candidate's own anchors
@@ -316,7 +407,12 @@ pub fn extend_candidate(
         p_chance: 1.0,
         support_ids: Vec::new(),
         accepted: false,
+        n_support_nights: 0,
+        n_support_tracklets: 0,
+        lambda_tracklet: 0.0,
+        p_chance_tracklet: 1.0,
     };
+    let mut nights = NightTally::default();
     for v in visits {
         if params.exclude_anchor_nights && anchor_nights.contains(&v.night) {
             continue;
@@ -331,18 +427,29 @@ pub fn extend_candidate(
             continue; // the prediction left the footprint: not an opportunity
         }
         out.n_opportunities += 1;
-        out.lambda += v.density() * disc;
+        let p_v = v.density() * disc;
+        out.lambda += p_v;
+        let mut hit_here = 0usize;
         for id in v.within(&pred, params.tolerance) {
             if used_ids.contains(&id) {
                 continue;
             }
             out.support_ids.push(id);
             out.n_support += 1;
+            hit_here += 1;
         }
+        nights.observe(v.night, p_v, hit_here > 0);
     }
+    let (n_nights, n_tracklets, lam_t) = nights.finish();
+    out.n_support_nights = n_nights;
+    out.n_support_tracklets = n_tracklets;
+    out.lambda_tracklet = lam_t;
     out.p_chance = chance_probability(out.n_support, out.lambda, params.dispersion);
-    out.accepted =
-        out.n_support >= params.min_support && out.p_chance <= params.max_chance_probability;
+    out.p_chance_tracklet =
+        chance_probability(out.n_support_tracklets, out.lambda_tracklet, params.dispersion);
+    out.accepted = out.n_support >= params.min_support
+        && out.p_chance <= params.max_chance_probability
+        && out.n_support_tracklets >= params.min_support_tracklets;
     out
 }
 
@@ -470,6 +577,86 @@ mod tests {
         let per_sq_deg = v.density() * (std::f64::consts::PI / 180.0).powi(2);
         assert!(per_sq_deg > 100.0 && per_sq_deg < 1.0e5, "{per_sq_deg} per deg^2");
     }
+
+    #[test]
+    fn a_night_with_one_opportunity_visit_can_never_carry_a_tracklet() {
+        // 🔴 EXACT zero, asserted as equality. The tracklet statistic's whole claim is that a
+        // single-visit night contributes no chance tracklet; if that leaked even at 1e-18 it
+        // would accumulate over the ~58% of Rubin position-nights that get one visit.
+        let mut t = NightTally::default();
+        for (i, p) in [1e-4, 3e-3, 0.2, 2.0].iter().enumerate() {
+            t.observe(60_000 + i as i64, *p, true);
+        }
+        let (n_nights, n_tracklets, lambda) = t.finish();
+        assert_eq!(n_nights, 4, "each night carried support");
+        assert_eq!(n_tracklets, 0, "no night had a second visit");
+        assert_eq!(lambda, 0.0, "single-visit nights must contribute exactly zero, got {lambda}");
+    }
+
+    #[test]
+    fn a_tracklet_needs_two_distinct_visits_not_two_detections() {
+        // One visit carrying support twice is a blend, not a tracklet: `observe` is called once
+        // per visit with a boolean, so the count cannot be inflated by a crowded single visit.
+        let mut one = NightTally::default();
+        one.observe(60_000, 1e-3, true);
+        assert_eq!(one.finish().1, 0, "one visit is not a tracklet however many detections");
+
+        let mut two = NightTally::default();
+        two.observe(60_000, 1e-3, true);
+        two.observe(60_000, 1e-3, true);
+        assert_eq!(two.finish().1, 1, "two supporting visits on one night are a tracklet");
+
+        let mut split = NightTally::default();
+        split.observe(60_000, 1e-3, true);
+        split.observe(60_001, 1e-3, true);
+        assert_eq!(split.finish().1, 0, "two nights, one visit each, is not a tracklet");
+
+        let mut half = NightTally::default();
+        half.observe(60_000, 1e-3, true);
+        half.observe(60_000, 1e-3, false);
+        assert_eq!(half.finish().1, 0, "the second visit must itself carry support");
+    }
+
+    #[test]
+    fn the_chance_tracklet_rate_matches_brute_force_enumeration() {
+        // The finaliser is a streaming form of P(>= 2 of n independent visits hit). Checked
+        // against enumeration over every subset, which is the definition -- not against a
+        // rearrangement of the same algebra, which would agree with its own mistakes.
+        for ps in [
+            vec![1e-4, 2e-4],
+            vec![0.01, 0.02, 0.03],
+            vec![0.3, 0.25, 0.4, 0.1],
+            vec![0.9, 0.8],
+        ] {
+            let mut t = NightTally::default();
+            for &p in &ps {
+                t.observe(60_000, p, false);
+            }
+            let got = t.finish().2;
+
+            let e: Vec<f64> = ps.iter().map(|p| 1.0 - (-p).exp()).collect();
+            let mut brute = 0.0;
+            for mask in 0u32..(1 << e.len()) {
+                if (mask.count_ones() as usize) < 2 {
+                    continue;
+                }
+                let mut term = 1.0;
+                for (i, &ei) in e.iter().enumerate() {
+                    term *= if mask & (1 << i) != 0 { ei } else { 1.0 - ei };
+                }
+                brute += term;
+            }
+            assert!(
+                (got - brute).abs() < 1e-12 * brute.max(1e-12),
+                "ps {ps:?}: streaming {got:.12e} vs enumerated {brute:.12e}"
+            );
+        }
+    }
+
+    // 🔴 There is deliberately NO unit test asserting that `min_support_tracklets = 0` leaves
+    // acceptance unchanged: written here it could only restate the `&&` in `extend_candidate`
+    // and would agree with its own mistakes. That claim is proved end to end instead, by the
+    // node-1 candidate file coming back byte-identical to the pre-change build.
 
     #[test]
     fn a_candidate_with_no_support_is_not_accepted_however_many_opportunities_it_had() {

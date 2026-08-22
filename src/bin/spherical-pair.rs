@@ -182,6 +182,15 @@ struct Extension {
     /// 🔴 Support on the anchors' own nights is nearly free (it confirms the detection, not the
     /// orbit) and the shift control endorses it. Keep true unless deliberately measuring that.
     exclude_anchor_nights: bool,
+    /// Require the support to come from TRACKLETS: cross-nights carrying support in two or more
+    /// distinct visits. 0 is off and leaves acceptance exactly as before.
+    ///
+    /// ⭐ `#[serde(default)]`, and the only field in this struct that has one. Every existing
+    /// config was written before this statistic existed and describes a run that did not use it;
+    /// defaulting to 0 keeps those runs reproducible, where `deny_unknown_fields` plus a required
+    /// field would make each of them fail to load.
+    #[serde(default)]
+    min_support_tracklets: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,6 +661,7 @@ fn run_search(
         exclude_anchor_nights: cfg.extension.exclude_anchor_nights,
         min_support: cfg.extension.min_support,
         max_chance_probability: cfg.extension.max_chance_probability,
+        min_support_tracklets: cfg.extension.min_support_tracklets,
     };
 
     // 🔴 Opened BEFORE the node loop, exactly as it always was: a diagnostic pointed at a live
@@ -664,6 +674,10 @@ fn run_search(
         hdr.write_record([
             "r_au", "rdot", "night_a", "night_b", "chi2", "n_opp", "n_support", "lambda",
             "p_chance", "accepted", "epoch", "h", "x", "y", "z", "vx", "vy", "vz",
+            // 🔴 APPENDED, not inserted. Column positions 1-18 are what every existing reader in
+            // this lane uses -- the awk diagnostics index $6..$9 -- so a new column in the middle
+            // would silently re-point them at the wrong quantity on new files only.
+            "n_sup_nights", "n_sup_tracklets", "lambda_tracklet", "p_chance_tracklet",
         ])?;
         out.write_all(&hdr.into_inner()?)?;
     }
@@ -907,6 +921,10 @@ fn run_search(
                                 format!("{:.12e}", c.state[3]),
                                 format!("{:.12e}", c.state[4]),
                                 format!("{:.12e}", c.state[5]),
+                                format!("{}", sup.n_support_nights),
+                                format!("{}", sup.n_support_tracklets),
+                                format!("{:.6}", sup.lambda_tracklet),
+                                format!("{:.6e}", sup.p_chance_tracklet),
                             ])
                             .expect("writing a record into a Vec cannot fail");
                         }
