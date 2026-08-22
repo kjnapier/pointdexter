@@ -920,37 +920,78 @@ fn run_search(
             //
             // Sequential pairs also bound memory to one pair's rows and keep the output file in
             // exactly the order the serial loop wrote it.
-            for &(i, j) in &pair_ix {
-                let (ka, aa) = (&per_night[i].0, &per_night[i].1);
-                let (kb, ab) = (&per_night[j].0, &per_night[j].1);
-                let (cands, t) = anchor_pairs_and_solve(
-                    &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap, cfg.anchor.chi2_max,
-                    cfg.anchor.guided_rdot_frac_max,
-                );
-                candidates += cands.len();
-                // 🔴 report the GATED count too. Without it "0 candidates, 0 rejected" cannot
-                // distinguish "the gate admitted no pairs" from "every pair failed chi2" -- which
-                // is the exact confusion the module docs warn about, and this binary had it.
-                gated += cands.len() + t.total();
-                tally.absorb(&t);
+            // ⭐ Night-pairs run in PARALLEL CHUNKS. The serial version's note was right on all
+            // three counts, so each is answered rather than overridden:
+            //
+            //   ORDER  -- `collect` on an indexed parallel iterator preserves order, and a chunk
+            //             is fully written before the next starts. The file is byte-for-byte the
+            //             sequence the serial loop wrote; the byte-comparison defence survives.
+            //   MEMORY -- chunks are cut on a cumulative ANCHOR-PRODUCT budget, not a fixed count.
+            //             The budget is the largest single pair's product, so a heavy pair lands
+            //             in a chunk by itself and peak memory stays at ~one heavy pair's rows --
+            //             the same bound the serial loop had.
+            //   SKEW   -- the note is right that fanning out ACROSS pairs *instead of* inside them
+            //             collapses to the heaviest pair. The inner parallelism is untouched here:
+            //             heavy pairs still spread over slots and candidates, and the outer level
+            //             only fills cores the small pairs cannot.
+            //
+            // 🔴 Measured before the change, on this export: 231 pairs/node, median 2.5 ms, max
+            // 0.24-0.77 s, top 12 carrying 38-61% of the time, and CPU 4946% of a 12800% machine.
+            // The ~219 small pairs are what leave the machine idle; they are the target.
+            let proxy = |ix: &(usize, usize)| -> u128 {
+                (per_night[ix.0].1.len() as u128) * (per_night[ix.1].1.len() as u128)
+            };
+            // Budget = the largest single pair's product, so a heavy pair lands in a chunk
+            // alone and a chunk of small ones sums to no more than that. Measured on this export
+            // (3 nodes, 891k detections): peak RSS 522 MB serial -> 806 MB, and max/4 gives
+            // 690 MB for 9.37 s against 8.15 s -- 15% of the speed to save 14% of the memory,
+            // which is not a good trade here. 🔴 At full-arc scale (4.1 GB per node) the heavy
+            // pair dominates a chunk either way, so the RELATIVE overhead should fall; if a large
+            // run ever gets tight, divide this and re-measure both numbers.
+            let budget = pair_ix.iter().map(proxy).max().unwrap_or(1).max(1);
+            let mut np_chunks: Vec<Vec<(usize, usize)>> = Vec::new();
+            {
+                let (mut cur, mut acc_p) = (Vec::new(), 0u128);
+                for ix in &pair_ix {
+                    let w = proxy(ix);
+                    if !cur.is_empty() && acc_p + w > budget {
+                        np_chunks.push(std::mem::take(&mut cur));
+                        acc_p = 0;
+                    }
+                    cur.push(*ix);
+                    acc_p += w;
+                }
+                if !cur.is_empty() {
+                    np_chunks.push(cur);
+                }
+            }
 
-                // Extension is the tall pole per candidate, and candidates are independent.
-                // Chunked so the per-task overhead is amortised and each task's rows share one
-                // in-memory `csv::Writer` -- the same writer type, so quoting and escaping stay
-                // the code that wrote every existing candidate file.
-                let parts: Vec<(Vec<u8>, usize, usize)> = cands
-                    .par_chunks(CANDIDATE_CHUNK)
-                    .map(|chunk| {
-                        let mut w = csv::Writer::from_writer(Vec::new());
-                        let (mut acc, mut sup_n) = (0usize, 0usize);
-                        for c in chunk {
-                            let sup = extend_candidate(
-                                &set.obs, c, &node, mu, &visit_index, &params,
-                            );
-                            if sup.accepted {
-                                acc += 1;
-                            }
-                            sup_n += usize::from(sup.n_support > 0);
+            for chunk in &np_chunks {
+                let outs: Vec<(Vec<u8>, usize, usize, usize, usize, pointdexter::spherical_pair_anchor::RejectTally)> = chunk
+                    .par_iter()
+                    .map(|&(i, j)| {
+                        let (ka, aa) = (&per_night[i].0, &per_night[i].1);
+                        let (kb, ab) = (&per_night[j].0, &per_night[j].1);
+                        let (cands, t) = anchor_pairs_and_solve(
+                            &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap,
+                            cfg.anchor.chi2_max, cfg.anchor.guided_rdot_frac_max,
+                        );
+                        let n_c = cands.len();
+                        let gated_d = n_c + t.total();
+
+                        let parts: Vec<(Vec<u8>, usize, usize)> = cands
+                            .par_chunks(CANDIDATE_CHUNK)
+                            .map(|chunk| {
+                                let mut w = csv::Writer::from_writer(Vec::new());
+                                let (mut acc, mut sup_n) = (0usize, 0usize);
+                                for c in chunk {
+                                    let sup = extend_candidate(
+                                        &set.obs, c, &node, mu, &visit_index, &params,
+                                    );
+                                    if sup.accepted {
+                                        acc += 1;
+                                    }
+                                    sup_n += usize::from(sup.n_support > 0);
                             w.write_record([
                                 format!("{}", spec.r_au),
                                 format!("{}", spec.rdot_au_per_day),
@@ -994,14 +1035,29 @@ fn run_search(
                                     String::new()
                                 },
                             ])
-                            .expect("writing a record into a Vec cannot fail");
+                                        .expect("writing a record into a Vec cannot fail");
+                                }
+                                let buf =
+                                    w.into_inner().expect("flushing a Vec writer cannot fail");
+                                (buf, acc, sup_n)
+                            })
+                            .collect();
+
+                        let (mut buf, mut acc, mut sup_n) = (Vec::new(), 0usize, 0usize);
+                        for (b, a, s) in parts {
+                            buf.extend_from_slice(&b);
+                            acc += a;
+                            sup_n += s;
                         }
-                        let buf = w.into_inner().expect("flushing a Vec writer cannot fail");
-                        (buf, acc, sup_n)
+                        (buf, n_c, gated_d, acc, sup_n, t)
                     })
                     .collect();
-                for (buf, acc, sup_n) in parts {
+
+                for (buf, n_c, gated_d, acc, sup_n, t) in outs {
                     out.write_all(&buf)?;
+                    candidates += n_c;
+                    gated += gated_d;
+                    tally.absorb(&t);
                     accepted += acc;
                     supported += sup_n;
                 }
