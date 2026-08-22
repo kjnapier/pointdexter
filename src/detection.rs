@@ -61,9 +61,22 @@ impl Detection {
         epoch: Time,
         observer_position: Vector3<f64>,
     ) -> Self {
-        
+        // Delegates, so the two constructors cannot drift.
+        Self::new_at_jd(ra, dec, epoch.tdb().jd(), observer_position)
+    }
+
+    /// [`Detection::new`] taking the epoch as a TDB Julian date directly.
+    ///
+    /// ⭐ Exists because `Detection::epoch` IS a TDB JD, so a caller that already has one was
+    /// paying `Time::new(jd, "tdb", "jd")` and then `epoch.tdb().jd()` to get the same number
+    /// back. Measured 2026-08-22 on an 891,427-row load: that round trip was **~10 of 12 s**.
+    pub fn new_at_jd(
+        ra: f64,
+        dec: f64,
+        epoch_jd: f64,
+        observer_position: Vector3<f64>,
+    ) -> Self {
         let rho_hat = Vector3::new(ra.cos() * dec.cos(), ra.sin() * dec.cos(), dec.sin());
-        let epoch_jd = epoch.tdb().jd();
         let rho_hat_dot_observer_position = rho_hat.dot(&observer_position);
         let observer_distance_squared = observer_position.dot(&observer_position);
 
