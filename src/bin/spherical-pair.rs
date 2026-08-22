@@ -175,6 +175,12 @@ struct AnchorCfg {
     guided_rdot_frac_max: f64,
 }
 
+/// Default for [`Extension::fg_interpolate`]. A named function because `#[serde(default)]` on a
+/// `bool` is unconditionally `false`, and this field's default is `true`.
+fn default_fg_interpolate() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Extension {
@@ -198,11 +204,19 @@ struct Extension {
     /// Replace the per-opportunity universal-Kepler solve in the support stage with the `(f, g)`
     /// interpolant (`SCOPE_c2_extend_no_kepler.md` §4).
     ///
-    /// 🔴 `#[serde(default)]` = false. Measured agreement with the exact path is ~1.6e-10 arcsec,
-    /// ten orders inside a 10" gather -- but not bit-identical, and every candidate file this lane
-    /// has byte-compared came from the exact path. Opt in, like `min_support_tracklets` and
-    /// `anchor.guided_rdot_frac_max`.
-    #[serde(default)]
+    /// ⭐ **Defaults to TRUE** (MJH, 2026-08-22). It earned that: the candidate file is
+    /// BYTE-IDENTICAL to the exact path -- md5 09324f51... over 305,938,903 bytes and ~1.1M rows,
+    /// with extension counts equal to the unit at every node -- and the interpolant agrees with
+    /// `canonical_step` to ~1.6e-10 arcsec, ten orders inside a 10" gather. It is also spot-checked
+    /// per candidate and falls back to the exact path when the check fails, so a candidate whose
+    /// sweep leaves the `< pi` regime cannot silently take the approximation.
+    ///
+    /// 🔴 That byte-identity is measured on ONE workload (891,427 detections, 3 nodes at
+    /// r = 45.2, ~1-year window). A different window or node could still tip a boundary in the
+    /// last digit. Set `fg_interpolate: false` explicitly to reproduce a file written by the exact
+    /// path -- that is the switch to reach for when a byte-comparison against an OLD candidate file
+    /// disagrees, before concluding anything else changed.
+    #[serde(default = "default_fg_interpolate")]
     fg_interpolate: bool,
     /// Also write `support_ids`, the ids of the supporting detections themselves.
     ///
