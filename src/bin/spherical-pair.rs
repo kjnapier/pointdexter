@@ -195,6 +195,15 @@ struct Extension {
     /// 🔴 Support on the anchors' own nights is nearly free (it confirms the detection, not the
     /// orbit) and the shift control endorses it. Keep true unless deliberately measuring that.
     exclude_anchor_nights: bool,
+    /// Replace the per-opportunity universal-Kepler solve in the support stage with the `(f, g)`
+    /// interpolant (`SCOPE_c2_extend_no_kepler.md` §4).
+    ///
+    /// 🔴 `#[serde(default)]` = false. Measured agreement with the exact path is ~1.6e-10 arcsec,
+    /// ten orders inside a 10" gather -- but not bit-identical, and every candidate file this lane
+    /// has byte-compared came from the exact path. Opt in, like `min_support_tracklets` and
+    /// `anchor.guided_rdot_frac_max`.
+    #[serde(default)]
+    fg_interpolate: bool,
     /// Also write `support_ids`, the ids of the supporting detections themselves.
     ///
     /// 🔴 `#[serde(default)]` = false. The four ANCHOR ids are always written -- fixed width, and
@@ -691,6 +700,7 @@ fn run_search(
         min_support: cfg.extension.min_support,
         max_chance_probability: cfg.extension.max_chance_probability,
         min_support_tracklets: cfg.extension.min_support_tracklets,
+        fg_interpolate: cfg.extension.fg_interpolate,
     };
 
     // 🔴 Opened BEFORE the node loop, exactly as it always was: a diagnostic pointed at a live

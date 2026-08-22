@@ -439,9 +439,262 @@ fn wrap_0_2pi(x: f64) -> f64 {
 /// The revolution count is exact, not estimated: a full period sweeps exactly `2*pi`, so the
 /// leftover always sweeps less than `2*pi`, and `floor(dt/T)` is the count. An unbound orbit
 /// sweeps less than `2*pi` in total, so there `T` does not exist and the count is zero.
+/// Interpolation nodes for the (f, g) polynomial. FIXED at 9, and that is a measured decision:
+/// `SCOPE_c2_extend_no_kepler.md` §5 Table 1 puts the max angular error at ~1e-10" over windows
+/// from 62 d to 730 d, i.e. **flat in window length**, nine orders inside a 10" gather and eight
+/// inside the 0.15" astrometric floor. Nothing about the data warrants varying it.
+pub(crate) const FG_NODES: usize = 9;
+
+/// How far the bracket search may double before giving up.
+const FG_MAX_EXPAND: usize = 60;
+
+/// A degree-8 polynomial interpolant for the canonical `f` and `g` over one time window.
+///
+/// ⭐ THE POINT: `canonical_step` costs an iterative universal-Kepler solve, and the support stage
+/// runs one per opportunity (~165 on the live window). But `swept_angle` reads only `pos`, and
+/// `pos = [f*r + g*rdot, g*h/r]` -- so `(f, g)` is the whole per-epoch dependence, and both are
+/// closed form in the universal anomaly `s`. Sampling in `s` therefore costs **zero Kepler
+/// solves**; `s(t)` is the expensive direction and we simply never go that way.
+/// See `SCOPE_c2_extend_no_kepler.md` §4 (MJH, 2026-08-17).
+///
+/// 🔴 Represented barycentrically rather than as Chebyshev coefficients. The interpolating
+/// polynomial through 9 points at degree 8 is UNIQUE, so this is the same polynomial the design's
+/// `fit_chebyshev_direct` would produce -- but with no `DMatrix`, no LU, and no heap allocation
+/// per candidate, which matters in a loop that already spends ~15% of the run in allocator and
+/// epoch-reclamation traffic.
+pub(crate) struct FgInterp {
+    /// Node abscissae in SCALED time, `x = (t - t_mid)/t_half`, in [-1, 1].
+    x: [f64; FG_NODES],
+    f: [f64; FG_NODES],
+    g: [f64; FG_NODES],
+    /// Barycentric weights for `x`.
+    w: [f64; FG_NODES],
+    t_mid: f64,
+    t_half: f64,
+}
+
+/// `(dt, f, g)` at universal anomaly `s`, all closed form. No root-find.
+///
+/// `dt(s)` is the Kepler residual solved for time, and `f`/`g` are exactly the combination
+/// `canonical_step` forms after its solve -- written here from the same expressions so the two
+/// cannot drift apart silently.
+fn fg_at_s(node: &Node, mu: f64, alpha: f64, s: f64) -> (f64, f64, f64) {
+    let sqrt_mu = mu.sqrt();
+    let z = alpha * s * s;
+    let (c, sc) = stumpff_c2_c3(z);
+    let dt = ((node.r * node.rdot / sqrt_mu) * s * s * c
+        + (1.0 - alpha * node.r) * s * s * s * sc
+        + node.r * s)
+        / sqrt_mu;
+    let f = 1.0 - s * s / node.r * c;
+    let g = dt - s * s * s / sqrt_mu * sc;
+    (dt, f, g)
+}
+
+/// Canonical-frame position from `(f, g)` -- the identity `canonical_step` ends on.
+pub(crate) fn pos_from_fg(node: &Node, h: f64, f: f64, g: f64) -> [f64; 2] {
+    [f * node.r + g * node.rdot, g * (h / node.r)]
+}
+
+impl FgInterp {
+    /// Build over `[t_lo, t_hi]`, both measured from `pair.t_ref` exactly as `canonical_step`'s
+    /// `dt` is.
+    ///
+    /// 🔴 The window must be the FULL support epoch span. `SCOPE_c2_extend_no_kepler.md` §5
+    /// Table 2: evaluating 12x outside the fit interval costs **0.33"**, which would pass a 10"
+    /// gather and then decide membership in a tight re-gather -- the [[silent-filter-pattern]]
+    /// shape exactly. Overshooting the window is free (accuracy is flat in window length), so the
+    /// bracket below deliberately errs outward.
+    pub(crate) fn build(node: &Node, h: f64, mu: f64, t_lo: f64, t_hi: f64) -> Option<Self> {
+        if !(t_lo <= t_hi) || !t_lo.is_finite() || !t_hi.is_finite() {
+            return None;
+        }
+        let alpha = alpha_of(node, h, mu);
+        if !alpha.is_finite() {
+            return None;
+        }
+        // `dt(s)` is strictly increasing -- `d(dt)/ds = r(s)/sqrt(mu) > 0` -- so a doubling search
+        // brackets it, and `dt(0) = 0` gives the seed side for free.
+        let seed = (mu.sqrt() * t_hi.abs().max(t_lo.abs()) / node.r).abs().max(1.0);
+        let mut s_hi = seed;
+        let mut n = 0;
+        while fg_at_s(node, mu, alpha, s_hi).0 < t_hi {
+            s_hi *= 2.0;
+            n += 1;
+            if n > FG_MAX_EXPAND || !s_hi.is_finite() {
+                return None;
+            }
+        }
+        let mut s_lo = -seed;
+        n = 0;
+        while fg_at_s(node, mu, alpha, s_lo).0 > t_lo {
+            s_lo *= 2.0;
+            n += 1;
+            if n > FG_MAX_EXPAND || !s_lo.is_finite() {
+                return None;
+            }
+        }
+
+        // 🔴 TIGHTEN, do not stop at the doubling bracket. Measured 2026-08-22: doubling alone
+        // overshoots the requested window by **6-10x in t**, not the ~2x the design assumed, and
+        // nine nodes spread over a window an order of magnitude too wide lose exactly the
+        // resolution they were placed to provide. The design's "overshooting costs nothing" is
+        // true of 2x and false of 10x.
+        //
+        // Bisection is safe here because `dt(s)` is strictly increasing, and it is CHEAP: each
+        // step is one Stumpff evaluation, not a universal-Kepler solve with polish. ~30 of them
+        // once per candidate against ~165 Kepler solves per candidate is noise.
+        let tighten = |target: f64, mut lo: f64, mut hi: f64| -> f64 {
+            for _ in 0..30 {
+                let m = 0.5 * (lo + hi);
+                if fg_at_s(node, mu, alpha, m).0 < target { lo = m } else { hi = m }
+            }
+            0.5 * (lo + hi)
+        };
+        // Keep a sliver of margin outside the window so every evaluation point stays INTERIOR --
+        // Table 2's failure mode is evaluating outside the fit interval, which is superexponential.
+        let pad = 0.02 * (t_hi - t_lo).abs().max(1.0);
+        s_hi = tighten(t_hi + pad, 0.0_f64.min(s_lo), s_hi);
+        s_lo = tighten(t_lo - pad, s_lo, 0.0_f64.max(s_hi));
+
+        // Chebyshev-LOBATTO in `s`: includes both endpoints, unlike Chebyshev-Gauss, so the
+        // window edges are interpolated rather than extrapolated.
+        let mid = 0.5 * (s_hi + s_lo);
+        let half = 0.5 * (s_hi - s_lo);
+        let mut ts = [0.0; FG_NODES];
+        let mut f = [0.0; FG_NODES];
+        let mut g = [0.0; FG_NODES];
+        for k in 0..FG_NODES {
+            let s_k = mid + half * (std::f64::consts::PI * (k as f64) / ((FG_NODES - 1) as f64)).cos();
+            let (dt_k, f_k, g_k) = fg_at_s(node, mu, alpha, s_k);
+            if !dt_k.is_finite() || !f_k.is_finite() || !g_k.is_finite() {
+                return None;
+            }
+            ts[k] = dt_k;
+            f[k] = f_k;
+            g[k] = g_k;
+        }
+
+        // Scale to [-1, 1] on the ACHIEVED t range, which the Lobatto-in-s nodes make non-uniform.
+        let (mut t_min, mut t_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &v in &ts {
+            t_min = t_min.min(v);
+            t_max = t_max.max(v);
+        }
+        let t_mid = 0.5 * (t_max + t_min);
+        let t_half = 0.5 * (t_max - t_min);
+        if !(t_half > 0.0) || !t_half.is_finite() {
+            return None;
+        }
+        let mut x = [0.0; FG_NODES];
+        for k in 0..FG_NODES {
+            x[k] = (ts[k] - t_mid) / t_half;
+        }
+
+        // Barycentric weights, O(n^2) once per candidate.
+        let mut w = [0.0; FG_NODES];
+        for j in 0..FG_NODES {
+            let mut prod = 1.0;
+            for k in 0..FG_NODES {
+                if k != j {
+                    let d = x[j] - x[k];
+                    if d == 0.0 {
+                        return None; // duplicate abscissa: the map t(s) collapsed
+                    }
+                    prod *= d;
+                }
+            }
+            w[j] = 1.0 / prod;
+        }
+
+        Some(FgInterp { x, f, g, w, t_mid, t_half })
+    }
+
+    /// `(f, g)` at `dt` from `t_ref`. Two barycentric evaluations, no Kepler solve.
+    pub(crate) fn eval(&self, dt: f64) -> (f64, f64) {
+        let x = (dt - self.t_mid) / self.t_half;
+        let (mut nf, mut ng, mut den) = (0.0f64, 0.0f64, 0.0f64);
+        for j in 0..FG_NODES {
+            let d = x - self.x[j];
+            if d == 0.0 {
+                return (self.f[j], self.g[j]); // exactly on a node
+            }
+            let q = self.w[j] / d;
+            nf += q * self.f[j];
+            ng += q * self.g[j];
+            den += q;
+        }
+        (nf / den, ng / den)
+    }
+
+    /// Per-candidate spot check at an interior point that is NOT a node.
+    ///
+    /// 🔴 This is a MEASUREMENT, not an appeal to Table 1. A wrong-node solve returns a bound
+    /// orbit 96.4% of the time, and the interpolant is built before anything evaluates the sweep,
+    /// so a candidate whose sweep leaves the `< pi` regime can reach here. There the polynomial
+    /// does not degrade, it DETACHES -- an earlier probe found 2.6e+5" at every degree. Hence:
+    /// verify per candidate, fall back to the exact path when it fails.
+    pub(crate) fn spot_check(&self, node: &Node, h: f64, mu: f64, tol_rel: f64) -> bool {
+        let alpha = alpha_of(node, h, mu);
+        // Between two interior nodes in `s`-space the polynomial is least constrained; take the
+        // midpoint of the two central `x` nodes, mapped back through the exact relation.
+        let j = FG_NODES / 2;
+        let x_probe = 0.5 * (self.x[j] + self.x[j - 1]);
+        let t_probe = x_probe * self.t_half + self.t_mid;
+        // The exact side needs `s(t_probe)`, which is the direction we avoid -- so instead probe
+        // in `s`: take the `s` midpoint of those same two nodes and compare AT ITS OWN t.
+        let s_mid = {
+            // recover the s bracket from the node abscissae is not possible directly, so redo the
+            // cheap closed-form scan: bisect dt(s) = t_probe. dt is monotone, so this is safe and
+            // costs a handful of Stumpff evaluations -- still no root-find on the hot path.
+            let mut lo = -1.0f64;
+            let mut hi = 1.0f64;
+            let mut n = 0;
+            while fg_at_s(node, mu, alpha, hi).0 < t_probe && n < FG_MAX_EXPAND {
+                hi *= 2.0;
+                n += 1;
+            }
+            n = 0;
+            while fg_at_s(node, mu, alpha, lo).0 > t_probe && n < FG_MAX_EXPAND {
+                lo *= 2.0;
+                n += 1;
+            }
+            for _ in 0..40 {
+                let m = 0.5 * (lo + hi);
+                if fg_at_s(node, mu, alpha, m).0 < t_probe { lo = m } else { hi = m }
+            }
+            0.5 * (lo + hi)
+        };
+        let (t_exact, f_exact, g_exact) = fg_at_s(node, mu, alpha, s_mid);
+        if !t_exact.is_finite() || !f_exact.is_finite() || !g_exact.is_finite() {
+            return false;
+        }
+        let (f_p, g_p) = self.eval(t_exact);
+        let p_exact = pos_from_fg(node, h, f_exact, g_exact);
+        let p_poly = pos_from_fg(node, h, f_p, g_p);
+        let r = hypot2(p_exact);
+        if !(r > 0.0) {
+            return false;
+        }
+        let dx = p_poly[0] - p_exact[0];
+        let dy = p_poly[1] - p_exact[1];
+        (dx * dx + dy * dy).sqrt() / r <= tol_rel
+    }
+}
+
 pub(crate) fn swept_angle(node: &Node, h: f64, mu: f64, s0: &CanonicalState, s1: &CanonicalState, dt: f64) -> f64 {
-    let phi0 = s0.pos[1].atan2(s0.pos[0]);
-    let phi1 = s1.pos[1].atan2(s1.pos[0]);
+    swept_angle_pos(node, h, mu, s0.pos, s1.pos, dt)
+}
+
+/// [`swept_angle`] taking bare canonical positions.
+///
+/// ⭐ Exists so the interpolated path and the exact path share ONE implementation of the sweep.
+/// `swept_angle` reads nothing from `CanonicalState` but `pos`, and the `(f, g)` interpolant
+/// produces `pos` without a Kepler solve; duplicating the revolution bookkeeping instead of
+/// sharing it is how the two silently disagree by a multiple of TAU.
+pub(crate) fn swept_angle_pos(node: &Node, h: f64, mu: f64, p0: [f64; 2], p1: [f64; 2], dt: f64) -> f64 {
+    let phi0 = p0[1].atan2(p0[0]);
+    let phi1 = p1[1].atan2(p1[0]);
     // h > 0 by construction, so motion is counter-clockwise and the sweep is positive.
     let partial = wrap_0_2pi(phi1 - phi0);
 
@@ -1108,6 +1361,118 @@ mod tests {
     /// exact `h`, `brent` aborted on it, and `solve_h` reported the PHYSICAL rejection
     /// `NoBoundRoot`. The pair was a real bound orbit with a real sign change on the scan grid.
     #[test]
+    #[test]
+    fn the_fg_interpolant_reproduces_canonical_step_to_under_a_milliarcsecond() {
+        // 🔴 SCOPE_c2_extend_no_kepler.md §6 test 1: assert against `canonical_step` ITSELF, not
+        // against the design note's Table 1. Four orders tighter than anything downstream can
+        // feel and six orders looser than the table, so a failure here is a CODING error, not a
+        // tolerance dispute.
+        const MAS: f64 = 4.848_136_811_095_36e-9; // 1 milliarcsecond, in radians
+        let mu = Origin::SSB.mu();
+        let mut worst = 0.0f64;
+        let mut checked = 0usize;
+        let mut percase: Vec<String> = Vec::new();
+        for &(r, rdot) in &[
+            (35.7, 0.0),
+            (45.0, 0.0),
+            (62.0, 0.0),
+            (40.0, -0.5 / 365.25),
+            (45.0, 1.2 / 365.25),
+        ] {
+            let node = Node { r, rdot };
+            let h_max = h_max(&node, mu).expect("bound node");
+            for &frac in &[0.5, 0.8, 0.95] {
+                let h = h_max * frac;
+                let mut case_worst = 0.0f64;
+                // the 730 d span Rubin wants, per Table 1's widest column
+                let (t_lo, t_hi) = (-365.0, 365.0);
+                let interp = FgInterp::build(&node, h, mu, t_lo, t_hi)
+                    .expect("interpolant must build on a bound node");
+                for i in 0..=200 {
+                    let dt = t_lo + (t_hi - t_lo) * (i as f64) / 200.0;
+                    let Some(exact) = canonical_step(&node, h, dt, mu) else { continue };
+                    let (f_p, g_p) = interp.eval(dt);
+                    let poly = pos_from_fg(&node, h, f_p, g_p);
+                    let rr = hypot2(exact.pos);
+                    if !(rr > 0.0) {
+                        continue;
+                    }
+                    let dx = poly[0] - exact.pos[0];
+                    let dy = poly[1] - exact.pos[1];
+                    let e = (dx * dx + dy * dy).sqrt() / rr;
+                    worst = worst.max(e);
+                    case_worst = case_worst.max(e);
+                    checked += 1;
+                }
+                percase.push(format!("r{r} rdot{rdot:.1e} h{frac}: {:.2e}\"", case_worst * 206264.806));
+            }
+        }
+        assert!(checked > 2000, "only {checked} comparisons; the loop is not exercising anything");
+        // Printed so the achieved MARGIN is visible under --nocapture, not just the pass/fail.
+        eprintln!("fg interpolant: worst {:.3e} rad = {:.3e} mas over {checked} points", worst, worst / MAS);
+        eprintln!("PERCASE {}", percase.join(" | "));
+        assert!(
+            worst < MAS,
+            "worst |pos_poly - pos_exact|/r = {:.3e} rad = {:.4} mas, over {checked} points",
+            worst,
+            worst / MAS
+        );
+        // 🔴 AND a bar that can actually SEE a regression. SCOPE §6 specifies 1 mas, and 1 mas is
+        // useless as a guard here: when the bracket overshot the window by 10x the error was
+        // 1.86e-4" -- a 10^6 degradation that sailed through the 1 mas assertion at 0.186 mas.
+        // Achieved is ~1.6e-10"; 1e-9" leaves 6x headroom and would have failed that bug loudly.
+        let worst_arcsec = worst * 206_264.806_247_096_36;
+        assert!(
+            worst_arcsec < 1.0e-9,
+            "worst {worst_arcsec:.3e}\" exceeds the 1e-9\" regression bar (achieved is ~1.6e-10\"); \
+             the usual cause is the fit window no longer being tight around the evaluation range"
+        );
+    }
+
+    #[test]
+    fn the_fg_fit_window_stays_tight_around_the_requested_range() {
+        // 🔴 The defect this guards, measured 2026-08-22: bracketing `s` by doubling ALONE landed
+        // the nodes over a t-window **6-10x** wider than requested, costing 10^6 in accuracy while
+        // still passing the SCOPE-specified 1 mas bar. The design's "overshooting by 2x costs
+        // nothing" is true at 2x and false at 10x, so tightness is asserted, not assumed.
+        let mu = Origin::SSB.mu();
+        for &(r, rdot) in &[(62.0, 0.0), (45.0, 0.0), (40.0, -0.5 / 365.25), (45.0, 1.2 / 365.25)] {
+            let node = Node { r, rdot };
+            let h = h_max(&node, mu).expect("bound") * 0.8;
+            let (t_lo, t_hi) = (-365.0, 365.0);
+            let interp = FgInterp::build(&node, h, mu, t_lo, t_hi).expect("builds");
+            let span = 2.0 * interp.t_half;
+            let ratio = span / (t_hi - t_lo);
+            assert!(
+                ratio < 1.2,
+                "r={r} rdot={rdot:.2e}: fit window is {ratio:.2}x the requested range; \
+                 the bracket is not being tightened"
+            );
+            // and it must still CONTAIN the range, or evaluation extrapolates -- Table 2's
+            // superexponential failure.
+            assert!(
+                interp.t_mid - interp.t_half <= t_lo && interp.t_mid + interp.t_half >= t_hi,
+                "r={r}: fit window does not contain the requested range"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fg_spot_check_passes_on_the_regime_the_ladder_emits() {
+        // The guard must not cry wolf on ordinary bound TNO nodes, or the fallback becomes the
+        // path and the whole exercise is pointless.
+        let mu = Origin::SSB.mu();
+        for &(r, rdot) in &[(35.7, 0.0), (45.0, 0.0), (62.0, 0.0), (40.0, -0.5 / 365.25)] {
+            let node = Node { r, rdot };
+            let h = h_max(&node, mu).expect("bound") * 0.8;
+            let interp = FgInterp::build(&node, h, mu, -365.0, 365.0).expect("builds");
+            assert!(
+                interp.spot_check(&node, h, mu, 1e-9),
+                "spot check failed on an ordinary node r={r} rdot={rdot}"
+            );
+        }
+    }
+
     fn canonical_step_survives_the_dependency_stagnating_near_parabolic() {
         let node = Node { r: 3.40000000000000000e1, rdot: 4.00000000000000008e-3 };
         let h = 4.05837124060365595e-2;

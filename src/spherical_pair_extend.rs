@@ -40,7 +40,10 @@
 use nalgebra::Vector3;
 
 use crate::spherical_pair::{Node, Pair};
-use crate::spherical_pair_anchor::{Candidate, Obs, anchor_frame, predict_hat_in};
+use crate::spherical_pair::FgInterp;
+use crate::spherical_pair_anchor::{
+    Candidate, Obs, anchor_frame, predict_hat_in, predict_hat_interp,
+};
 use crate::spherical_pair_index::chord_of_angle;
 
 use kiddo::SquaredEuclidean;
@@ -162,6 +165,13 @@ impl VisitIndex {
     }
 }
 
+/// Relative position tolerance the per-candidate interpolant spot check must meet.
+///
+/// Achieved on the regime the ladder emits is ~7.7e-16; this is seven orders looser, because it is
+/// not a quality bar but a DETACHMENT detector -- the failure it exists to catch is 2.6e+5 arcsec,
+/// not a few ulp.
+const FG_SPOT_TOL_REL: f64 = 1.0e-9;
+
 /// How to gather and how to score. No `Default`: every one of these was a measured decision.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtendParams {
@@ -177,6 +187,13 @@ pub struct ExtendParams {
     pub min_support: usize,
     /// Accept only if chance would produce this much support with probability below this.
     pub max_chance_probability: f64,
+    /// Replace the per-opportunity universal-Kepler solve with the `(f, g)` interpolant.
+    ///
+    /// 🔴 `false` is the default and reproduces the exact path bit for bit. The interpolant agrees
+    /// with `canonical_step` to ~1.6e-10 arcsec (measured, `the_fg_interpolant_reproduces_...`),
+    /// which is 10 orders inside a 10" gather -- but "10 orders inside" is not "identical", and
+    /// every candidate file this lane has byte-compared was written by the exact path.
+    pub fg_interpolate: bool,
     /// Require this many supporting **tracklets** -- cross-nights carrying support in two or more
     /// distinct visits. 0 leaves acceptance exactly as it was.
     ///
@@ -399,6 +416,29 @@ pub fn extend_candidate(
     // See `SCOPE_c2_extend_no_kepler.md` §2 and `AnchorFrame`.
     let frame = anchor_frame(&pair, node, cand.h, mu);
 
+    // The `(f, g)` interpolant, built once per candidate over the FULL visit epoch span.
+    //
+    // 🔴 The window must contain every epoch this loop will evaluate --
+    // `SCOPE_c2_extend_no_kepler.md` §5 Table 2: outside the fit interval the error is not merely
+    // larger, it grows superexponentially (0.33" at 12x out), and 0.33" passes a 10" gather while
+    // deciding membership in a tight re-gather. That is the [[silent-filter-pattern]] shape, so
+    // the span is taken over ALL visits, not the ones that survive the filters below.
+    //
+    // 🔴 And it is SPOT-CHECKED per candidate, not trusted from a table. A wrong-node solve returns
+    // a bound orbit 96.4% of the time, and a candidate whose sweep leaves the `< pi` regime makes
+    // the polynomial detach rather than degrade. On failure we simply keep the exact path.
+    let interp = if params.fg_interpolate {
+        let (mut t_lo, mut t_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for v in visits {
+            t_lo = t_lo.min(v.epoch - pair.t_ref);
+            t_hi = t_hi.max(v.epoch - pair.t_ref);
+        }
+        FgInterp::build(node, cand.h, mu, t_lo, t_hi)
+            .filter(|i| i.spot_check(node, cand.h, mu, FG_SPOT_TOL_REL))
+    } else {
+        None
+    };
+
     let disc = std::f64::consts::PI * params.tolerance * params.tolerance;
     let mut out = Support {
         n_opportunities: 0,
@@ -417,10 +457,10 @@ pub fn extend_candidate(
         if params.exclude_anchor_nights && anchor_nights.contains(&v.night) {
             continue;
         }
-        let Some(pred) = frame
-            .as_ref()
-            .and_then(|f| predict_hat_in(f, &pair, node, cand.h, mu, v.epoch, &v.observer))
-        else {
+        let Some(pred) = frame.as_ref().and_then(|f| match interp.as_ref() {
+            Some(ip) => predict_hat_interp(f, &pair, node, cand.h, mu, v.epoch, &v.observer, ip),
+            None => predict_hat_in(f, &pair, node, cand.h, mu, v.epoch, &v.observer),
+        }) else {
             continue;
         };
         if !v.contains(&pred) {

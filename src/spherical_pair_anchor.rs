@@ -44,8 +44,8 @@ use nalgebra::Vector3;
 use rayon::prelude::*;
 
 use crate::spherical_pair::{
-    CanonicalState, GuidedCheck, Node, Pair, PairPoint, ScanCensus, Solution, canonical_step,
-    hypot2, range_quadratic, swept_angle,
+    CanonicalState, FgInterp, GuidedCheck, Node, Pair, PairPoint, ScanCensus, Solution,
+    canonical_step, hypot2, pos_from_fg, range_quadratic, swept_angle, swept_angle_pos,
 };
 use crate::spherical_pair_grid::rdot_span;
 use crate::spherical_pair_index::{BaryIndex, gate_radius_astrometric};
@@ -275,6 +275,47 @@ pub fn position_at_in(
     // sweep from anchor A to t, in the same sense the solve used
     let d_nu = swept_angle(node, h, mu, &frame.s_a, &s_t, t - pair.a.epoch);
     Some(r_t * (d_nu.cos() * frame.a_hat + d_nu.sin() * frame.t_hat))
+}
+
+/// [`position_at_in`] with the Kepler solve replaced by the `(f, g)` interpolant.
+///
+/// ⭐ This is the whole point of `SCOPE_c2_extend_no_kepler.md`: `swept_angle` needs only `pos`,
+/// and `pos = [f*r + g*rdot, g*h/r]`, so an interpolant in `(f, g)` removes the ONE remaining
+/// universal-Kepler solve per opportunity. Everything else here is identical to `position_at_in`
+/// -- same frame, same sweep function, same combination -- so a disagreement between the two can
+/// only come from the interpolant.
+pub fn position_at_interp(
+    frame: &AnchorFrame,
+    pair: &Pair,
+    node: &Node,
+    h: f64,
+    mu: f64,
+    t: f64,
+    interp: &FgInterp,
+) -> Option<Vector3<f64>> {
+    let (f, g) = interp.eval(t - pair.t_ref);
+    let pos = pos_from_fg(node, h, f, g);
+    let r_t = hypot2(pos);
+    if !(r_t > 0.0) || !r_t.is_finite() {
+        return None;
+    }
+    let d_nu = swept_angle_pos(node, h, mu, frame.s_a.pos, pos, t - pair.a.epoch);
+    Some(r_t * (d_nu.cos() * frame.a_hat + d_nu.sin() * frame.t_hat))
+}
+
+/// [`predict_hat_in`] through the interpolant.
+pub fn predict_hat_interp(
+    frame: &AnchorFrame,
+    pair: &Pair,
+    node: &Node,
+    h: f64,
+    mu: f64,
+    t: f64,
+    observer: &Vector3<f64>,
+    interp: &FgInterp,
+) -> Option<Vector3<f64>> {
+    let p = position_at_interp(frame, pair, node, h, mu, t, interp)?;
+    topocentric_hat(&p, observer)
 }
 
 /// Topocentric unit vector predicted at `t`, as seen from `observer`.
