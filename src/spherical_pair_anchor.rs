@@ -47,6 +47,7 @@ use crate::spherical_pair::{
     CanonicalState, GuidedCheck, Node, Pair, PairPoint, ScanCensus, Solution, canonical_step,
     hypot2, range_quadratic, swept_angle,
 };
+use crate::spherical_pair_grid::rdot_span;
 use crate::spherical_pair_index::{BaryIndex, gate_radius_astrometric};
 
 /// 95% of chi2 with 4 degrees of freedom: the measured pre-extension gate.
@@ -316,6 +317,43 @@ fn topocentric_hat(p: &Vector3<f64>, observer: &Vector3<f64>) -> Option<Vector3<
 /// Solve one anchor pair and vet it.
 ///
 /// 🔴 The two anchors are ordered by epoch here and nowhere else, so no caller can get it wrong.
+/// Should this node's pairs take the guided root-find rather than the blind 80-point scan?
+///
+/// [`Pair::solve_h_guided`] brackets a closed-form guess and widens until it OBSERVES a sign
+/// change, falling back to the full scan when it cannot -- so its `Bound` set is a SUPERSET of
+/// the scan's and this choice can never lose a candidate. What it can lose is TIME: a pair with
+/// no root pays the expansion and then the scan anyway.
+///
+/// Measured (`RESULT_c2_signcensus.md`): the no-root fraction is 0.49-0.95% at `rdot = 0` but
+/// 81.9% at 91% of the bound limit and 92.2% at 96%, and the aggregate goes from 10.4-10.6x
+/// FASTER to 0.83x -- i.e. slower. Hence a decision per NODE, taken once from `|rdot|` as a
+/// fraction of the bound limit `sqrt(2 mu / r)`.
+///
+/// 🔴 Deliberately NOT adaptive on the observed no-root rate. The pair loop is `par_iter` and
+/// order-preserving by design; a switch thrown partway through, once a probe had seen enough
+/// pairs, would make the output depend on thread scheduling and forfeit the byte-comparison that
+/// is this lane's only defence against a silent numerical change.
+///
+/// 🔴 `frac_max = 0.0` disables it entirely and is the DEFAULT. Guided and scan agree only to
+/// ~3.4e-13 in `h`, so switching moves the last digits of every float in the candidate CSV. That
+/// is not a regression, but an existing config must not acquire it silently -- the same reason
+/// `min_support_tracklets` defaults to 0.
+///
+/// ⚠️ The break-even is NOT measured. The census has no points between `rdot = 0` and ~91% of the
+/// limit, so the shape of no-root(rdot) in between is unknown. Solving the cost model at the two
+/// measured endpoints puts break-even near a no-root fraction of ~0.75, which under any monotone
+/// shape sits well above half the limit; 0.5 is therefore conservative by construction rather
+/// than optimal. Measuring intermediate `rdot` with `--sign-census` is what would tune it.
+pub fn guided_is_profitable(node: &Node, mu: f64, frac_max: f64) -> bool {
+    // `!(x > 0.0)` rather than `x <= 0.0`: it also rejects NaN, which would otherwise make the
+    // comparison below false in a way that reads as a deliberate "off" rather than a bad config.
+    if !(frac_max > 0.0) {
+        return false;
+    }
+    let limit = 0.5 * rdot_span(node.r, mu);
+    limit.is_finite() && limit > 0.0 && node.rdot.abs() <= frac_max * limit
+}
+
 pub fn solve_anchor_pair(
     obs: &[Obs],
     anchor_a: Anchor,
@@ -323,6 +361,9 @@ pub fn solve_anchor_pair(
     node: &Node,
     mu: f64,
     chi2_cut: f64,
+    // Take the guided root-find. Decided ONCE PER NODE by `guided_is_profitable`, never here: a
+    // per-pair decision would apply a different bracket policy to different pairs of one node.
+    use_guided: bool,
 ) -> Result<Candidate, Reject> {
     // 🔴 THE ORDERING GUARD. See the module docs: reversed endpoints return a retrograde orbit
     // that solves silently with a ~20x residual.
@@ -338,7 +379,11 @@ pub fn solve_anchor_pair(
 
     let t_ref = 0.5 * (a0.epoch + b0.epoch);
     let pair = Pair { t_ref, a: a0.point(), b: b0.point() };
-    let h = match pair.solve_h(node, mu) {
+    // Same `Solution` either way; `solve_h_guided` falls back to `solve_h` internally, so the
+    // outcome set is a superset and every arm below is reached identically.
+    let solution =
+        if use_guided { pair.solve_h_guided(node, mu) } else { pair.solve_h(node, mu) };
+    let h = match solution {
         Solution::UnboundNode => return Err(Reject::UnboundNode),
         Solution::NoBoundRoot { .. } => return Err(Reject::NoBoundRoot),
         Solution::Bound { h, .. } => h,
@@ -383,12 +428,18 @@ pub fn anchor_pairs_and_solve(
     mu: f64,
     sigma_cap: f64,
     chi2_cut: f64,
+    // Fraction of the bound `rdot` limit below which this node takes the guided root-find. 0.0 is
+    // off and reproduces the blind scan exactly. See `guided_is_profitable`.
+    guided_rdot_frac_max: f64,
 ) -> (Vec<Candidate>, RejectTally) {
     let mut tally = RejectTally::default();
     let mut out = Vec::new();
     if anchors_a.is_empty() || anchors_b.is_empty() {
         return (out, tally);
     }
+    // ONCE PER NODE, before the parallel loop, so every pair of this node takes the same path and
+    // the result cannot depend on thread scheduling.
+    let use_guided = guided_is_profitable(node, mu, guided_rdot_frac_max);
     // gate on the widest anchor separation the two sets can produce: it must not reject a pair for
     // sitting at the far end of its own night
     let dt_max = anchors_a
@@ -431,7 +482,7 @@ pub fn anchor_pairs_and_solve(
             for hit in ib.within_idx(&q, cap) {
                 let a = anchors_a[ia.ids[slot] as usize];
                 let b = anchors_b[ib.ids[hit] as usize];
-                match solve_anchor_pair(obs, a, b, node, mu, chi2_cut) {
+                match solve_anchor_pair(obs, a, b, node, mu, chi2_cut, use_guided) {
                     Ok(c) => cands.push(c),
                     Err(e) => t.count(e),
                 }
@@ -556,6 +607,57 @@ mod tests {
         Origin::SSB.mu()
     }
 
+    #[test]
+    fn the_guided_dispatch_is_off_by_default_and_at_zero_fraction() {
+        // 🔴 The default-off contract. Guided and scan agree only to ~3.4e-13 in h, so a config
+        // that predates the knob must keep taking the scan; if this ever passes with `true` the
+        // last digits of every historical candidate CSV stop reproducing.
+        let n = Node { r: 45.0, rdot: 0.0 };
+        assert!(!guided_is_profitable(&n, mu(), 0.0), "0.0 must mean off even at rdot = 0");
+        assert!(!guided_is_profitable(&n, mu(), f64::NAN), "a NaN fraction must read as off");
+        assert!(guided_is_profitable(&n, mu(), 0.5), "rdot = 0 is the case guided is 10x on");
+    }
+
+    #[test]
+    fn the_dispatch_fraction_reproduces_the_census_node_labels() {
+        // ⭐ The census (`RESULT_c2_signcensus.md`) labels its high-rdot nodes "96% of bound limit"
+        // (r=34, rdot=4.0e-3) and "91% of limit" (r=62, rdot=2.8e-3). Recomputing those labels
+        // here pins this predicate to the same definition of "limit" the measured no-root
+        // fractions were taken against.
+        //
+        // 🔴 The trap this guards: `rdot_span` is the FULL span 2*sqrt(2 mu / r), so the limit is
+        // HALF of it. Using the span itself would halve every fraction -- a node at 96% of the
+        // limit would read as 48% and be dispatched to guided in exactly the regime the census
+        // measured at 0.83x, i.e. the change would silently do the opposite of its purpose.
+        for (r, rdot, want) in [(34.0, 4.0e-3, 0.96), (62.0, 2.8e-3, 0.91)] {
+            let limit = 0.5 * rdot_span(r, mu());
+            let frac = rdot / limit;
+            assert!(
+                (frac - want).abs() < 0.01,
+                "r={r} rdot={rdot}: census says {want} of the limit, computed {frac:.4}"
+            );
+            // Just inside its own fraction it dispatches; just outside it does not.
+            let n = Node { r, rdot };
+            assert!(guided_is_profitable(&n, mu(), frac + 1e-6));
+            assert!(!guided_is_profitable(&n, mu(), frac - 1e-6));
+        }
+    }
+
+    #[test]
+    fn the_dispatch_is_symmetric_in_the_sign_of_rdot() {
+        // The census measured +4.0e-3 and -4.0e-3 at r=34 and got 92.2331% / 92.2328% -- the same
+        // population to four digits. The predicate must not distinguish them.
+        for frac in [0.1, 0.5, 0.9] {
+            let up = Node { r: 34.0, rdot: 4.0e-3 };
+            let down = Node { r: 34.0, rdot: -4.0e-3 };
+            assert_eq!(
+                guided_is_profitable(&up, mu(), frac),
+                guided_is_profitable(&down, mu(), frac),
+                "sign of rdot changed the dispatch at frac {frac}"
+            );
+        }
+    }
+
     /// A synthetic object built from the canonical formulation, observed from a circular observer.
     ///
     /// ⭐ Generated by the SAME machinery the solve inverts. That is deliberate and it is what the
@@ -629,7 +731,7 @@ mod tests {
         let (truth, obs) = synth(&epochs(), 45.0, -1.0e-4, 0.12 / 206_264.806_247_096_36);
         let a = Anchor { first: 0, second: 1 };
         let b = Anchor { first: 2, second: 3 };
-        let c = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4)
+        let c = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4, false)
             .expect("the true node must solve and pass");
         // with no astrometric noise the two unused detections must be predicted essentially exactly
         assert!(c.chi2 < 1e-6, "chi2 {} should be ~0 on a noiseless object", c.chi2);
@@ -649,8 +751,8 @@ mod tests {
         let b = Anchor { first: 2, second: 3 };
 
         // 🔴 the guard: handing the pair over reversed must give the IDENTICAL candidate
-        let fwd = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4).unwrap();
-        let rev = solve_anchor_pair(&obs, b, a, &truth.node, mu(), CHI2_CUT_DOF4).unwrap();
+        let fwd = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4, false).unwrap();
+        let rev = solve_anchor_pair(&obs, b, a, &truth.node, mu(), CHI2_CUT_DOF4, false).unwrap();
         assert_eq!(fwd.epoch, rev.epoch, "the state epoch must be the earlier anchor's");
         assert!((fwd.h - rev.h).abs() <= f64::EPSILON * fwd.h.abs() * 8.0);
         assert!((fwd.chi2 - rev.chi2).abs() < 1e-9);
@@ -690,11 +792,11 @@ mod tests {
         let a = Anchor { first: 0, second: 1 };
         let b = Anchor { first: 2, second: 3 };
         // the true node passes
-        assert!(solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4).is_ok());
+        assert!(solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4, false).is_ok());
         // 🔴 but a wrong r must be REJECTED BY THE RESIDUAL, not by the solve: the solve is a
         // generator and will happily return a bound orbit at the wrong node
         let wrong = Node { r: 45.0 * 1.25, rdot: truth.node.rdot };
-        match solve_anchor_pair(&obs, a, b, &wrong, mu(), CHI2_CUT_DOF4) {
+        match solve_anchor_pair(&obs, a, b, &wrong, mu(), CHI2_CUT_DOF4, false) {
             Err(Reject::Chi2 { chi2 }) => assert!(chi2 > CHI2_CUT_DOF4),
             Err(Reject::NoBoundRoot) => { /* also a real rejection, and free */ }
             other => panic!("a 25% wrong r should not pass: {other:?}"),
@@ -723,7 +825,7 @@ mod tests {
         let b = vec![Anchor { first: 2, second: 3 }];
         let sigma_cap = obs[0].sigma * std::f64::consts::SQRT_2;
         let (cands, tally) =
-            anchor_pairs_and_solve(&obs, &a, &b, &truth.node, 3.0, mu(), sigma_cap, CHI2_CUT_DOF4);
+            anchor_pairs_and_solve(&obs, &a, &b, &truth.node, 3.0, mu(), sigma_cap, CHI2_CUT_DOF4, 0.0);
         assert_eq!(cands.len() + tally.total(), 1, "every gated pair must be accounted for");
         assert_eq!(cands.len(), 1, "the true node should keep its own object");
     }

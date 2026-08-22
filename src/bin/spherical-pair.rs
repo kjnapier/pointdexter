@@ -160,6 +160,19 @@ struct AnchorCfg {
     max_anchor_baseline_days: f64,
     /// Replaces the reference's `chi2_thresh = 2.0`. 9.488 is 95% of chi2_4, the measured gate.
     chi2_max: f64,
+    /// Take the guided root-find on nodes whose `|rdot|` is below this fraction of the bound
+    /// limit `sqrt(2 mu / r)`. See `spherical_pair_anchor::guided_is_profitable`.
+    ///
+    /// 🔴 `#[serde(default)]` = 0.0 = OFF, and that is deliberate. The guided path agrees with the
+    /// blind scan only to ~3.4e-13 in `h`, so enabling it moves the last digits of every float in
+    /// the candidate CSV. Every config written before this knob existed describes a run made with
+    /// the scan; defaulting to off keeps those runs byte-reproducible, exactly as
+    /// `min_support_tracklets` does.
+    ///
+    /// ⚠️ 0.5 is the suggested value if you turn it on, and it is conservative rather than
+    /// optimal -- the census measured no-root only at rdot = 0 and at 91-96% of the limit.
+    #[serde(default)]
+    guided_rdot_frac_max: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +447,14 @@ impl Config {
         pos("anchor.max_intra_night_hours", self.anchor.max_intra_night_hours)?;
         pos("anchor.max_anchor_baseline_days", self.anchor.max_anchor_baseline_days)?;
         pos("anchor.chi2_max", self.anchor.chi2_max)?;
+        // Not `pos`: 0.0 is the meaningful "off" value, so this is a range check, not positivity.
+        if !(self.anchor.guided_rdot_frac_max >= 0.0 && self.anchor.guided_rdot_frac_max <= 1.0) {
+            return Err(format!(
+                "anchor.guided_rdot_frac_max is a fraction of the bound rdot limit and must be in \
+                 [0, 1]; got {}",
+                self.anchor.guided_rdot_frac_max
+            ));
+        }
         pos("extension.tolerance_arcsec", self.extension.tolerance_arcsec)?;
         pos("gate.fallback_astrom_sigma_arcsec", self.gate.fallback_astrom_sigma_arcsec)?;
         if !(self.search.r_min_au < self.search.r_max_au) {
@@ -877,6 +898,7 @@ fn run_search(
                 let (kb, ab) = (&per_night[j].0, &per_night[j].1);
                 let (cands, t) = anchor_pairs_and_solve(
                     &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap, cfg.anchor.chi2_max,
+                    cfg.anchor.guided_rdot_frac_max,
                 );
                 candidates += cands.len();
                 // 🔴 report the GATED count too. Without it "0 candidates, 0 rejected" cannot
