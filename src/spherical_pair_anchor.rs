@@ -53,6 +53,47 @@ use crate::spherical_pair_index::{BaryIndex, gate_radius_astrometric};
 /// 95% of chi2 with 4 degrees of freedom: the measured pre-extension gate.
 pub const CHI2_CUT_DOF4: f64 = 9.488;
 
+/// The chi2 acceptance threshold, which is NOT one number.
+///
+/// `RESULT_c2_mislink_purity.md` measured the mislink rate at **0.018% below 32 d and 95.8% beyond
+/// 400 d** -- four orders of magnitude -- so a single threshold is tight where it costs recall and
+/// loose where it costs purity. `RESULT_c2_chi2max_curve.md` then measured the trade: 9.488 ->
+/// 18.47 takes the short-gap cohort from 4/33 to 14/33 while the control cohort moves 27 -> 30, and
+/// of the 242,445 candidates it adds only **1,623 (0.67%)** sit below 100 d. Loosening only the
+/// short end therefore buys the whole short-gap gain for **+0.9%** volume instead of +131%.
+///
+/// 🔴 `short_days <= 0.0` means OFF and reproduces a flat `max` EXACTLY -- that is the default, so
+/// a config that does not mention the new fields is byte-identical to before.
+#[derive(Debug, Clone, Copy)]
+pub struct Chi2Gate {
+    /// Applied at every baseline unless `short_days` puts this pair in the short regime.
+    pub max: f64,
+    /// Applied when the night-pair baseline is below `short_days`.
+    pub max_short: f64,
+    /// Baseline (days) below which `max_short` applies. 0 disables the split.
+    pub short_days: f64,
+}
+
+impl Chi2Gate {
+    /// One threshold everywhere -- the behaviour before the split existed.
+    pub fn flat(max: f64) -> Self {
+        Self { max, max_short: max, short_days: 0.0 }
+    }
+
+    /// 🔴 Strict `<`, matching the baseline bins the measurement used, so a threshold set at a bin
+    /// edge means what the table says it means.
+    #[inline]
+    pub fn cut(&self, dt_days: f64) -> f64 {
+        if self.short_days > 0.0 && dt_days < self.short_days { self.max_short } else { self.max }
+    }
+}
+
+impl From<f64> for Chi2Gate {
+    fn from(max: f64) -> Self {
+        Self::flat(max)
+    }
+}
+
 /// One detection, in the only terms this stage needs.
 ///
 /// Deliberately not `crate::detection::Detection`: that type is tangent-plane oriented and owned by
@@ -401,7 +442,7 @@ pub fn solve_anchor_pair(
     anchor_b: Anchor,
     node: &Node,
     mu: f64,
-    chi2_cut: f64,
+    chi2_gate: Chi2Gate,
     // Take the guided root-find. Decided ONCE PER NODE by `guided_is_profitable`, never here: a
     // per-pair decision would apply a different bracket policy to different pairs of one node.
     use_guided: bool,
@@ -450,7 +491,8 @@ pub fn solve_anchor_pair(
         }
         chi2 += d.dot(&d) / s2;
     }
-    if !(chi2 < chi2_cut) {
+    // 🔴 The threshold depends on the PAIR BASELINE, which is `dt_pair` above. Flat by default.
+    if !(chi2 < chi2_gate.cut(dt_pair)) {
         return Err(Reject::Chi2 { chi2 });
     }
     Ok(Candidate { state, epoch: a0.epoch, h, chi2, anchor_a, anchor_b })
@@ -468,7 +510,7 @@ pub fn anchor_pairs_and_solve(
     k: f64,
     mu: f64,
     sigma_cap: f64,
-    chi2_cut: f64,
+    chi2_gate: Chi2Gate,
     // Fraction of the bound `rdot` limit below which this node takes the guided root-find. 0.0 is
     // off and reproduces the blind scan exactly. See `guided_is_profitable`.
     guided_rdot_frac_max: f64,
@@ -523,7 +565,7 @@ pub fn anchor_pairs_and_solve(
             for hit in ib.within_idx(&q, cap) {
                 let a = anchors_a[ia.ids[slot] as usize];
                 let b = anchors_b[ib.ids[hit] as usize];
-                match solve_anchor_pair(obs, a, b, node, mu, chi2_cut, use_guided) {
+                match solve_anchor_pair(obs, a, b, node, mu, chi2_gate, use_guided) {
                     Ok(c) => cands.push(c),
                     Err(e) => t.count(e),
                 }
@@ -641,6 +683,25 @@ impl RejectTally {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_chi2_gate_is_flat_by_default_and_splits_only_when_asked() {
+        // 🔴 The default MUST be indistinguishable from the single threshold that preceded it --
+        // this lane's byte-comparison history against older candidate files depends on it.
+        let flat = Chi2Gate::flat(CHI2_CUT_DOF4);
+        for dt in [0.0, 1.0, 31.9, 100.0, 400.0, 1300.0] {
+            assert_eq!(flat.cut(dt), CHI2_CUT_DOF4);
+        }
+        assert_eq!(Chi2Gate::from(CHI2_CUT_DOF4).cut(7.0), CHI2_CUT_DOF4);
+
+        let split = Chi2Gate { max: 9.488, max_short: 18.47, short_days: 100.0 };
+        assert_eq!(split.cut(0.0), 18.47);
+        assert_eq!(split.cut(99.999), 18.47);
+        // strict `<` at the edge, so a threshold set at a bin edge means what the bin table says
+        assert_eq!(split.cut(100.0), 9.488);
+        assert_eq!(split.cut(1300.0), 9.488);
+    }
+
     use super::*;
     use spacerocks::coordinates::Origin;
 
@@ -772,7 +833,7 @@ mod tests {
         let (truth, obs) = synth(&epochs(), 45.0, -1.0e-4, 0.12 / 206_264.806_247_096_36);
         let a = Anchor { first: 0, second: 1 };
         let b = Anchor { first: 2, second: 3 };
-        let c = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4, false)
+        let c = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4.into(), false)
             .expect("the true node must solve and pass");
         // with no astrometric noise the two unused detections must be predicted essentially exactly
         assert!(c.chi2 < 1e-6, "chi2 {} should be ~0 on a noiseless object", c.chi2);
@@ -792,8 +853,8 @@ mod tests {
         let b = Anchor { first: 2, second: 3 };
 
         // 🔴 the guard: handing the pair over reversed must give the IDENTICAL candidate
-        let fwd = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4, false).unwrap();
-        let rev = solve_anchor_pair(&obs, b, a, &truth.node, mu(), CHI2_CUT_DOF4, false).unwrap();
+        let fwd = solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4.into(), false).unwrap();
+        let rev = solve_anchor_pair(&obs, b, a, &truth.node, mu(), CHI2_CUT_DOF4.into(), false).unwrap();
         assert_eq!(fwd.epoch, rev.epoch, "the state epoch must be the earlier anchor's");
         assert!((fwd.h - rev.h).abs() <= f64::EPSILON * fwd.h.abs() * 8.0);
         assert!((fwd.chi2 - rev.chi2).abs() < 1e-9);
@@ -833,11 +894,11 @@ mod tests {
         let a = Anchor { first: 0, second: 1 };
         let b = Anchor { first: 2, second: 3 };
         // the true node passes
-        assert!(solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4, false).is_ok());
+        assert!(solve_anchor_pair(&obs, a, b, &truth.node, mu(), CHI2_CUT_DOF4.into(), false).is_ok());
         // 🔴 but a wrong r must be REJECTED BY THE RESIDUAL, not by the solve: the solve is a
         // generator and will happily return a bound orbit at the wrong node
         let wrong = Node { r: 45.0 * 1.25, rdot: truth.node.rdot };
-        match solve_anchor_pair(&obs, a, b, &wrong, mu(), CHI2_CUT_DOF4, false) {
+        match solve_anchor_pair(&obs, a, b, &wrong, mu(), CHI2_CUT_DOF4.into(), false) {
             Err(Reject::Chi2 { chi2 }) => assert!(chi2 > CHI2_CUT_DOF4),
             Err(Reject::NoBoundRoot) => { /* also a real rejection, and free */ }
             other => panic!("a 25% wrong r should not pass: {other:?}"),
@@ -866,7 +927,7 @@ mod tests {
         let b = vec![Anchor { first: 2, second: 3 }];
         let sigma_cap = obs[0].sigma * std::f64::consts::SQRT_2;
         let (cands, tally) =
-            anchor_pairs_and_solve(&obs, &a, &b, &truth.node, 3.0, mu(), sigma_cap, CHI2_CUT_DOF4, 0.0);
+            anchor_pairs_and_solve(&obs, &a, &b, &truth.node, 3.0, mu(), sigma_cap, CHI2_CUT_DOF4.into(), 0.0);
         assert_eq!(cands.len() + tally.total(), 1, "every gated pair must be accounted for");
         assert_eq!(cands.len(), 1, "the true node should keep its own object");
     }

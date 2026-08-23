@@ -237,6 +237,98 @@ pub struct Support {
     /// not measured, and the tracklet counts are reported so the empirical rate can be read off
     /// the run rather than taken from the model.
     pub p_chance_tracklet: f64,
+    /// Which position path this candidate's opportunities were predicted on.
+    ///
+    /// 🔴 Reported, never written to the candidate CSV. The file has been byte-compared against
+    /// every previous build for the whole life of this lane; a new column would end that.
+    pub fg_path: FgPath,
+}
+
+/// Which prediction path one candidate took: the `(f, g)` interpolant, or the exact
+/// universal-Kepler step.
+///
+/// ⭐ Per CANDIDATE, not per opportunity. The interpolant is built once, before the visit loop,
+/// and every opportunity of that candidate then takes whatever that build decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FgPath {
+    /// `fg_interpolate` is off: the exact path, by configuration.
+    #[default]
+    Disabled,
+    /// The interpolant was built, passed its spot check, and carried the candidate.
+    Interpolated,
+    /// `FgInterp::build` returned `None` -- a degenerate or non-finite epoch window, a non-finite
+    /// `alpha`, or the doubling search running past `FG_MAX_EXPAND`.
+    BuildFailed,
+    /// It built, then disagreed with `canonical_step` past `FG_SPOT_TOL_REL`: the candidate's
+    /// sweep left the `< pi` regime, where the polynomial detaches rather than degrades.
+    SpotCheckFailed,
+}
+
+/// How many candidates took each prediction path.
+///
+/// ⭐ **This is the denominator of every `fg_interpolate` byte-identity claim.** A run that
+/// reproduces the exact path bit for bit with `fallbacks() == 0` says the INTERPOLANT is exact on
+/// that population; the same run with `fallbacks() > 0` says only that interpolant-plus-guard is,
+/// and the two are different statements about how much margin the `< pi` assumption has left.
+/// Before this counter existed the difference was invisible -- the failure path was a bare
+/// `.filter(..)` to `None` (`RESULT_c2_scale_validation.md` §4).
+///
+/// 🔴 It is also the perf number. A fallback pays the full Kepler cost, so a population that
+/// falls back often loses the Stage-4 speedup silently, with correct output and no error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FgTally {
+    pub disabled: usize,
+    pub interpolated: usize,
+    pub build_failed: usize,
+    pub spot_check_failed: usize,
+}
+
+impl FgTally {
+    pub fn count(&mut self, p: FgPath) {
+        match p {
+            FgPath::Disabled => self.disabled += 1,
+            FgPath::Interpolated => self.interpolated += 1,
+            FgPath::BuildFailed => self.build_failed += 1,
+            FgPath::SpotCheckFailed => self.spot_check_failed += 1,
+        }
+    }
+
+    /// Fold another tally in. Same reason as [`RejectTally::absorb`]: the candidate loop is
+    /// parallel over chunks, and a shared counter would be a lock on the hot path.
+    ///
+    /// [`RejectTally::absorb`]: crate::spherical_pair_anchor::RejectTally::absorb
+    pub fn absorb(&mut self, o: &FgTally) {
+        self.disabled += o.disabled;
+        self.interpolated += o.interpolated;
+        self.build_failed += o.build_failed;
+        self.spot_check_failed += o.spot_check_failed;
+    }
+
+    pub fn total(&self) -> usize {
+        self.disabled + self.interpolated + self.build_failed + self.spot_check_failed
+    }
+
+    /// Candidates that asked for the interpolant and silently got the exact path anyway.
+    ///
+    /// 🔴 `disabled` is NOT a fallback -- it is the exact path by configuration, which is a
+    /// different fact. Pooling them would make an `fg_interpolate: false` run look like a total
+    /// interpolant failure.
+    pub fn fallbacks(&self) -> usize {
+        self.build_failed + self.spot_check_failed
+    }
+
+    /// Fallbacks as a fraction of the candidates that actually asked for the interpolant.
+    ///
+    /// `NaN` when none did, deliberately: 0/0 is "not asked", and reporting it as 0% would read
+    /// as "asked, never fell back".
+    pub fn fallback_rate(&self) -> f64 {
+        let asked = self.interpolated + self.fallbacks();
+        if asked == 0 {
+            f64::NAN
+        } else {
+            (self.fallbacks() as f64) / (asked as f64)
+        }
+    }
 }
 
 /// `ln Gamma(x)` for `x > 0`, Lanczos g = 7, n = 9.
@@ -427,16 +519,27 @@ pub fn extend_candidate(
     // 🔴 And it is SPOT-CHECKED per candidate, not trusted from a table. A wrong-node solve returns
     // a bound orbit 96.4% of the time, and a candidate whose sweep leaves the `< pi` regime makes
     // the polynomial detach rather than degrade. On failure we simply keep the exact path.
-    let interp = if params.fg_interpolate {
+    //
+    // ⭐ The two failure doors are counted SEPARATELY (`FgTally`). They mean different things: a
+    // build failure is a degenerate window, while a spot-check failure is the regime assumption
+    // being wrong for this candidate -- and only the second says the `< pi` bracket is going
+    // marginal. Collapsing both to `None`, as this did before, made the guard's own firing rate
+    // unobservable.
+    let (interp, fg_path) = if params.fg_interpolate {
         let (mut t_lo, mut t_hi) = (f64::INFINITY, f64::NEG_INFINITY);
         for v in visits {
             t_lo = t_lo.min(v.epoch - pair.t_ref);
             t_hi = t_hi.max(v.epoch - pair.t_ref);
         }
-        FgInterp::build(node, cand.h, mu, t_lo, t_hi)
-            .filter(|i| i.spot_check(node, cand.h, mu, FG_SPOT_TOL_REL))
+        match FgInterp::build(node, cand.h, mu, t_lo, t_hi) {
+            None => (None, FgPath::BuildFailed),
+            Some(i) if i.spot_check(node, cand.h, mu, FG_SPOT_TOL_REL) => {
+                (Some(i), FgPath::Interpolated)
+            }
+            Some(_) => (None, FgPath::SpotCheckFailed),
+        }
     } else {
-        None
+        (None, FgPath::Disabled)
     };
 
     let disc = std::f64::consts::PI * params.tolerance * params.tolerance;
@@ -451,6 +554,7 @@ pub fn extend_candidate(
         n_support_tracklets: 0,
         lambda_tracklet: 0.0,
         p_chance_tracklet: 1.0,
+        fg_path,
     };
     let mut nights = NightTally::default();
     for v in visits {

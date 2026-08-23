@@ -41,8 +41,10 @@ use pointdexter::spherical_pair::{
     H_SCAN_HI_FRAC, H_SCAN_LO_FRAC, Node, Pair, Solution, gate_radius, h_max, h_scan_grid,
     range_quadratic,
 };
-use pointdexter::spherical_pair_anchor::{Anchor, anchor_pairs_and_solve, build_anchors};
-use pointdexter::spherical_pair_extend::{ExtendParams, VisitIndex, extend_candidate};
+use pointdexter::spherical_pair_anchor::{
+    Anchor, Chi2Gate, anchor_pairs_and_solve, build_anchors,
+};
+use pointdexter::spherical_pair_extend::{ExtendParams, FgTally, VisitIndex, extend_candidate};
 use pointdexter::spherical_pair_index::{
     BaryIndex, angle_of_chord, chord_of_angle, gate_radius_astrometric, pair_within_gate,
 };
@@ -89,6 +91,19 @@ struct Cli {
     /// no candidates and solves nothing.
     #[arg(long)]
     sign_census: bool,
+}
+
+/// Night-pair baseline bins for the reject tally, in days.
+///
+/// Chosen to match the bins the recall analysis already uses (`RESULT_c2_baseline_cap.md` section
+/// 7: 8-32 d and 32-100 d link at 9% and 7% against 59% at 200-400 d), so a reject mix can be read
+/// straight against a recall number rather than re-binned by eye. The last edge is the survey span.
+const BASELINE_BINS: [f64; 7] = [8.0, 32.0, 100.0, 200.0, 400.0, 700.0, 1300.0];
+const BASELINE_LABELS: [&str; 8] =
+    ["0-8", "8-32", "32-100", "100-200", "200-400", "400-700", "700-1300", "1300+"];
+
+fn baseline_bin(dt_days: f64) -> usize {
+    BASELINE_BINS.iter().position(|&e| dt_days < e).unwrap_or(BASELINE_BINS.len())
 }
 
 /// Which origin the frame and `mu` are taken from. Named, never numeric.
@@ -160,6 +175,14 @@ struct AnchorCfg {
     max_anchor_baseline_days: f64,
     /// Replaces the reference's `chi2_thresh = 2.0`. 9.488 is 95% of chi2_4, the measured gate.
     chi2_max: f64,
+    /// Loose threshold for night-pair baselines shorter than `chi2_short_baseline_days`.
+    /// Absent = the same as `chi2_max`, i.e. no split.
+    #[serde(default)]
+    chi2_max_short: Option<f64>,
+    /// Baseline (days) below which `chi2_max_short` applies. 🔴 0.0 (the default) is OFF and
+    /// reproduces a flat threshold byte-for-byte -- an existing config is unaffected.
+    #[serde(default)]
+    chi2_short_baseline_days: f64,
     /// Take the guided root-find on nodes whose `|rdot|` is below this fraction of the bound
     /// limit `sqrt(2 mu / r)`. See `spherical_pair_anchor::guided_is_profitable`.
     ///
@@ -478,6 +501,23 @@ impl Config {
         pos("anchor.max_intra_night_hours", self.anchor.max_intra_night_hours)?;
         pos("anchor.max_anchor_baseline_days", self.anchor.max_anchor_baseline_days)?;
         pos("anchor.chi2_max", self.anchor.chi2_max)?;
+        // 🔴 A short threshold with no baseline to apply it to, or a baseline with no threshold, is
+        // a config that says something it does not do. Refuse both rather than silently ignoring.
+        if self.anchor.chi2_short_baseline_days < 0.0 {
+            return Err("anchor.chi2_short_baseline_days must be >= 0 (0 disables the split)".into());
+        }
+        if self.anchor.chi2_short_baseline_days > 0.0 {
+            match self.anchor.chi2_max_short {
+                Some(v) if v > 0.0 => {}
+                _ => {
+                    return Err("anchor.chi2_short_baseline_days > 0 needs a positive \
+                                anchor.chi2_max_short".into());
+                }
+            }
+        } else if self.anchor.chi2_max_short.is_some() {
+            return Err("anchor.chi2_max_short is set but anchor.chi2_short_baseline_days is 0, \
+                        so it would never apply".into());
+        }
         // Not `pos`: 0.0 is the meaningful "off" value, so this is a range check, not positivity.
         if !(self.anchor.guided_rdot_frac_max >= 0.0 && self.anchor.guided_rdot_frac_max <= 1.0) {
             return Err(format!(
@@ -813,6 +853,18 @@ fn run_search(
         cfg.data.explicit_nodes.iter().map(|n| (*n, n.r_au)).collect()
     };
 
+    let chi2_gate = Chi2Gate {
+        max: cfg.anchor.chi2_max,
+        max_short: cfg.anchor.chi2_max_short.unwrap_or(cfg.anchor.chi2_max),
+        short_days: cfg.anchor.chi2_short_baseline_days,
+    };
+    if chi2_gate.short_days > 0.0 {
+        println!(
+            "  🔴 BASELINE-DEPENDENT chi2: {:.3} below {:.1} d, {:.3} at or above it",
+            chi2_gate.max_short, chi2_gate.short_days, chi2_gate.max
+        );
+    }
+
     for (spec, r_gate_lower) in &specs {
         let node = Node { r: spec.r_au, rdot: spec.rdot_au_per_day };
         // anchors per night: every visit pair inside the configured intra-night span
@@ -857,6 +909,10 @@ fn run_search(
         let mut accepted = 0usize;
         let mut supported = 0usize;
         let mut tally = pointdexter::spherical_pair_anchor::RejectTally::default();
+        let mut fg_tally = FgTally::default();
+        // (gated, candidates, tally) per baseline bin. Reported, never written to the CSV.
+        let mut dt_reject: Vec<(usize, usize, pointdexter::spherical_pair_anchor::RejectTally)> =
+            (0..=BASELINE_BINS.len()).map(|_| Default::default()).collect();
         // ⭐ The night-pair work list, materialised so it can be handed to rayon. Same baseline
         // test as the serial loop applied, in the same place, in the same i < j order.
         let mut pair_ix: Vec<(usize, usize)> = Vec::new();
@@ -981,23 +1037,32 @@ fn run_search(
             }
 
             for chunk in &np_chunks {
-                let outs: Vec<(Vec<u8>, usize, usize, usize, usize, pointdexter::spherical_pair_anchor::RejectTally)> = chunk
+                let outs: Vec<(
+                    Vec<u8>,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    pointdexter::spherical_pair_anchor::RejectTally,
+                    FgTally,
+                )> = chunk
                     .par_iter()
                     .map(|&(i, j)| {
                         let (ka, aa) = (&per_night[i].0, &per_night[i].1);
                         let (kb, ab) = (&per_night[j].0, &per_night[j].1);
                         let (cands, t) = anchor_pairs_and_solve(
                             &set.obs, aa, ab, &node, cfg.gate.k_sigma, mu, cap,
-                            cfg.anchor.chi2_max, cfg.anchor.guided_rdot_frac_max,
+                            chi2_gate, cfg.anchor.guided_rdot_frac_max,
                         );
                         let n_c = cands.len();
                         let gated_d = n_c + t.total();
 
-                        let parts: Vec<(Vec<u8>, usize, usize)> = cands
+                        let parts: Vec<(Vec<u8>, usize, usize, FgTally)> = cands
                             .par_chunks(CANDIDATE_CHUNK)
                             .map(|chunk| {
                                 let mut w = csv::Writer::from_writer(Vec::new());
                                 let (mut acc, mut sup_n) = (0usize, 0usize);
+                                let mut fg = FgTally::default();
                                 for c in chunk {
                                     let sup = extend_candidate(
                                         &set.obs, c, &node, mu, &visit_index, &params,
@@ -1005,6 +1070,9 @@ fn run_search(
                                     if sup.accepted {
                                         acc += 1;
                                     }
+                                    // 🔴 Counted, not written. `sup.fg_path` stays out of the
+                                    // record below -- see `Support::fg_path`.
+                                    fg.count(sup.fg_path);
                                     sup_n += usize::from(sup.n_support > 0);
                             w.write_record([
                                 format!("{}", spec.r_au),
@@ -1053,27 +1121,42 @@ fn run_search(
                                 }
                                 let buf =
                                     w.into_inner().expect("flushing a Vec writer cannot fail");
-                                (buf, acc, sup_n)
+                                (buf, acc, sup_n, fg)
                             })
                             .collect();
 
                         let (mut buf, mut acc, mut sup_n) = (Vec::new(), 0usize, 0usize);
-                        for (b, a, s) in parts {
+                        let mut fg = FgTally::default();
+                        for (b, a, s, f) in parts {
                             buf.extend_from_slice(&b);
                             acc += a;
                             sup_n += s;
+                            fg.absorb(&f);
                         }
-                        (buf, n_c, gated_d, acc, sup_n, t)
+                        (buf, n_c, gated_d, acc, sup_n, t, fg)
                     })
                     .collect();
 
-                for (buf, n_c, gated_d, acc, sup_n, t) in outs {
+                // 🔴 zip, not a second pass: `outs` is collected from `chunk.par_iter()` and an
+                // indexed parallel `collect` preserves order, which is the same guarantee the
+                // candidate file's byte-identity already rests on. A re-derivation of the pair
+                // list here could drift from the one that was actually solved.
+                for (&(pi, pj), (buf, n_c, gated_d, acc, sup_n, t, f)) in chunk.iter().zip(outs) {
+                    let dtb = baseline_bin(
+                        (set.obs[per_night[pj].1[0].first].epoch
+                            - set.obs[per_night[pi].1[0].first].epoch)
+                            .abs(),
+                    );
+                    dt_reject[dtb].0 += gated_d;
+                    dt_reject[dtb].1 += n_c;
+                    dt_reject[dtb].2.absorb(&t);
                     out.write_all(&buf)?;
                     candidates += n_c;
                     gated += gated_d;
                     tally.absorb(&t);
                     accepted += acc;
                     supported += sup_n;
+                    fg_tally.absorb(&f);
                 }
             }
         }
@@ -1202,6 +1285,28 @@ fn run_search(
             tally.no_prediction,
             tally.chi2
         );
+        // 🔴 Per BASELINE, because the bound-root test is not a uniform filter: it is ~1.55x
+        // more selective on short baselines, and that is where recall collapses. Empty bins are
+        // omitted rather than printed as zeros -- a node's pairs occupy only a few bins, and
+        // "0 gated" would say nothing while tripling the line.
+        if gated > 0 {
+            let mut parts: Vec<String> = Vec::new();
+            for (b, (g, c, t)) in dt_reject.iter().enumerate() {
+                if *g == 0 {
+                    continue;
+                }
+                let gf = *g as f64;
+                parts.push(format!(
+                    "{}d g={} c={:.3}% nbr={:.1}% chi2={:.1}%",
+                    BASELINE_LABELS[b],
+                    g,
+                    100.0 * *c as f64 / gf,
+                    100.0 * t.no_bound_root as f64 / gf,
+                    100.0 * t.chi2 as f64 / gf,
+                ));
+            }
+            println!("    reject by baseline: {}", parts.join(" | "));
+        }
         println!(
             "    extension: {supported} of {candidates} candidates found any cross-night support, \
              {accepted} accepted at p <= {:.0e} with >= {} support (dispersion {:.2})",
@@ -1209,6 +1314,28 @@ fn run_search(
             cfg.extension.min_support,
             cfg.extension.chance_dispersion
         );
+        // 🔴 Reported even when it is zero, and even when the interpolant is off. "0 fallbacks"
+        // is the statement that makes a byte-identity against the exact path a statement about
+        // the INTERPOLANT rather than about interpolant-plus-guard; silence cannot say it.
+        if fg_tally.total() > 0 {
+            if params.fg_interpolate {
+                println!(
+                    "    fg_interpolate: {} of {} candidates interpolated, {} fell back to the \
+                     exact path ({:.4}%: build {} / spot-check {})",
+                    fg_tally.interpolated,
+                    fg_tally.total(),
+                    fg_tally.fallbacks(),
+                    100.0 * fg_tally.fallback_rate(),
+                    fg_tally.build_failed,
+                    fg_tally.spot_check_failed,
+                );
+            } else {
+                println!(
+                    "    fg_interpolate: OFF -- all {} candidates on the exact path",
+                    fg_tally.disabled
+                );
+            }
+        }
     }
     out.flush()?;
     println!("candidates written to {}", cfg.io.output.display());
