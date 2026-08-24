@@ -23,6 +23,15 @@ search:
   # (r, rdot) nodes at a 1-yr reach against ~304 at 3-yr.
   reach_days: 365.25
   max_nodes: 100000
+  # Which statistic of the anchored residual sets the lever: median | p90. A POLICY, not a fact --
+  # how much of the extension window the cell must hold to `eps`. 🔴 The residual is identically
+  # ZERO at both anchors, so a median over a window whose epochs cluster near an anchor reports the
+  # lever too small, the cell too large, and the grid quietly stops covering. `median` is what
+  # every measured C2 run to date used, including the 9,723-node full ladder; `p90` moves node
+  # counts 1.6-3x and has never been run at scale.
+  # 🔴 Required, no default -- and this example was missing it (added 2026-08-24), so the file did
+  # not load at all: `--print-config` refused it with "search: missing field `lever_stat`".
+  lever_stat: median
 
 gate:
   # RESULT_c2_gate_ksigma.md. NOT optional and NOT defaulted: k = 0 reproduces the uncorrected
@@ -40,12 +49,50 @@ anchor:
   # epochs across its whole arc.
   max_intra_night_hours: 12.0
   # Replaces the reference's time_diff = 120.
+  #
+  # 🔴 LEFT AT 400 DELIBERATELY, and it is NOT the recall-optimal value -- it is a cost choice, so
+  # it should be made knowingly rather than inherited. Measured on the full ladder (2026-08-23):
+  # lifting it to 1300 (the survey span) takes candidate recall 66.9% -> 79.8%, +207 objects with
+  # ZERO lost, and takes a 231-object cohort whose only pairs exceed 400 d from 0 to 158. It costs
+  # 3.86x the candidates and 2.9x the wall, and the candidates it adds are the ones whose mislink
+  # rate is 73.6% (100-400 d) and 95.8% (400-1300 d). ⭐ Note also that the ladder SIZES its cells
+  # for the full 1,244 d span and then refuses to use them past this cap, so the two numbers being
+  # out of step is itself a defect: `search.reach_days` does not drive it.
+  # The +53 objects the chi2 split buys below were measured ON TOP OF a 1300 d cap.
   max_anchor_baseline_days: 400.0
   # Replaces the reference's chi2_thresh = 2.0. 9.488 is 95% of chi2_4, which is the dof of a
   # tracklet-x-tracklet pair (8 coordinates, 4 consumed). Measured rejection: 0.88 of chance at
   # Rubin's typical ~0.6 h anchor baseline, 0.997 at 6 h -- but the survey supplies a 6 h baseline
   # on only 2.3% of tracklet-forming position-nights, so 0.88 is the operating point.
   chi2_max: 9.488
+  # BASELINE-DEPENDENT above, measured 2026-08-23 and adopted as the default: below
+  # `chi2_short_baseline_days` the gate is `chi2_max_short` instead. 18.47 is 99.9% of chi2_4.
+  #
+  # Why: the short-gap objects -- two nights, one pair, gap < 100 d -- are exactly the ones the
+  # 95% cut refuses, by dose-response (cohort 1 -> 4 -> 9 -> 14 of 33 across 6.00/9.488/13.28/
+  # 18.47 while a > 100 d control cohort moves only 26 -> 30). Loosening EVERYWHERE also works
+  # and costs +131% candidate volume, because 99.3% of the candidates a loose cut adds sit above
+  # 100 d, where purity is already gone (73.6% and 95.8% mislink at 100-400 d and 400-1300 d).
+  # Splitting buys the same short-baseline gain for +1.5%.
+  #
+  # Full ladder, 9,723 nodes, r 30-300 AU, against an otherwise identical control (one grid,
+  # checked: same node count and same 11,846,533,507 gated pairs): candidate recall
+  # 79.8% -> 83.1%, +53 objects gained and ZERO lost, monotone across all six distance shells;
+  # accepted 86.2% -> 87.5%. Short-gap cohort 233 -> 281 of 376.
+  #
+  # The price, stated honestly: short-baseline mislink RISES (0-32 d 0.018% -> 0.433%, 32-100 d
+  # 0.205% -> 1.334%) and 100-400 d / 400-1300 d do not move at all. The overall mislink rate
+  # falls 65.9% -> 62.1%, but that is COMPOSITION -- pure short-baseline candidates diluting an
+  # unchanged pile of long-baseline junk -- and must not be quoted as a purity improvement.
+  # In absolute terms +53 objects cost +10,218 mislinked candidates, ~193 each, against ~14,000
+  # each for the baseline-cap lift.
+  #
+  # 🔴 100.0 is a BIN EDGE, not an optimum: 32-400 d has never been sampled.
+  # 🔴 The Rust defaults are still OFF (`chi2_short_baseline_days: 0.0` = flat), deliberately, so
+  # that a config written before this knob existed still reproduces its run byte for byte. The
+  # default lives HERE, in the example a new run is copied from, not in `#[serde(default)]`.
+  chi2_max_short: 18.47
+  chi2_short_baseline_days: 100.0
 
 extension:
   # NOT a free parameter: it is the grid cell. A node offset of half a cell (delta r/r = 0.32% at
