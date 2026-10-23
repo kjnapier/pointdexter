@@ -37,6 +37,7 @@ use std::io::{BufWriter, Write};
 //const MIN_NIGHTS: usize = 6;
 
 const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / PI;
+const IC_CHUNK: usize = 4096; // trial orbits per ordered output chunk (env MATT0_IC_CHUNK overrides)
 
 pub fn sync_detections_to_orbit(detections: &Vec<Detection>, ic: &InitialCondition) -> Vec<Option<[f64; 3]>> {
     let mut synced_points: Vec<Option<[f64; 3]>> = vec![None; detections.len()];
@@ -109,9 +110,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let n_ics = ics.len();
 
-    let mut ii = 0;
-
-    ics[..n_ics].par_iter().enumerate().for_each(|(ii, ic)| {
+    // Trial orbits run in parallel within chunks of ic_chunk, and each chunk is written in IC order, so the output
+    // file does not depend on the thread count or scheduling (and a killed run leaves only whole chunks).
+    let ic_chunk: usize = match std::env::var("MATT0_IC_CHUNK") {
+        Ok(s) => s.parse()?,
+        Err(_) => IC_CHUNK,
+    };
+    assert!(ic_chunk > 0, "MATT0_IC_CHUNK must be positive");
+    writeln!(cluster_file.lock().unwrap(), "# Output order: IC, in chunks of {}; equal-count peaks: lowest cell first", ic_chunk)?;
+    for (c, chunk) in ics[..n_ics].chunks(ic_chunk).enumerate() {
+    let outs: Vec<String> = chunk.par_iter().enumerate().map(|(k, ic)| {
+        let ii = c * ic_chunk + k;
         type Tree = ImmutableKdTree<f64, i32, 3, 32>; // item is u32 index into `points` array, 3D points, leaf capacity 32
 
         let mut out = String::new();
@@ -277,10 +286,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         }
         out.push_str(&format!("# Finished processing IC {} of {}: {} cells, {} of which had > {} points.\n", ii+1, n_ics, peaks.len(), not_skipped, config.min_unique_times));
-        // Write the output for this IC to the output file.
-        write!(cluster_file.lock().unwrap(), "{}", out);
-        //print!("{}", out);
-    });
+        out
+    }).collect();
+    // Write this chunk's output in IC order.
+    let mut f = cluster_file.lock().unwrap();
+    for out in outs.iter() {
+        write!(f, "{}", out)?;
+    }
+    f.flush()?;
+    }
                 
     
     Ok(())

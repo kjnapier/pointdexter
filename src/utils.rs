@@ -546,7 +546,9 @@ pub fn sum_hp_map_neighbors_v2(hp_map_counts: &HashMap<u64, usize>, nested: &Lay
 
 /// Find non-strict local maxima (peaks) in a HEALPix map.
 /// A tile is considered a peak if its value >= all its neighbors and value >= threshold.
-/// Returns list of (tile, value) pairs, sorted by decreasing value.
+/// Returns list of (tile, value) pairs, sorted by decreasing value, ties by increasing tile.
+/// The tie-break makes the order independent of the HashMap's iteration order (a per-process random seed):
+/// without it, which of two equal-value peaks reports a shared cluster changes from run to run.
 pub fn find_non_strict_peaks(
     map: &HashMap<u64, usize>,
     depth: u8,
@@ -579,8 +581,8 @@ pub fn find_non_strict_peaks(
         }
     }
 
-    // Sort by decreasing value
-    peaks.sort_by(|a, b| b.1.cmp(&a.1));
+    // Sort by decreasing value, then increasing tile
+    peaks.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
     peaks
 }
